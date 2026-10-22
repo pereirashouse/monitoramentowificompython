@@ -1,0 +1,12 @@
+{
+  "_comment": "Copie este arquivo para config.json e preencha com os valores do seu ambiente.",
+  "controller_url": "https://192.168.1.1",
+  "clients_path": "/proxy/network/api/s/SEU_SITE_ID/stat/sta",
+  "ssid": "wms",
+  "alert_drops_per_hour": 3,
+  "collector_macs": {
+    "b4:29:3d:aa:bb:01": "Urovo DT40",
+    "04:7b:cb:aa:bb:02": "Skorpio X5",
+    "3c:e1:a1:aa:bb:03": "Skorpio X5"
+  }
+}
