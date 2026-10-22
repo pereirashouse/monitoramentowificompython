@@ -1,5 +1,7 @@
 # wifi-collector-monitor
 
+[![Testes](https://github.com/pereirashouse/monitoramentowificompython/actions/workflows/testes.yml/badge.svg)](https://github.com/pereirashouse/monitoramentowificompython/actions/workflows/testes.yml)
+
 Monitor de quedas Wi-Fi para coletores de dados (WMS) via API local do UniFi.
 
 Detecta em tempo quase real quando coletores do SSID configurado somem e voltam, registra duração, AP e RSSI em CSV e gera relatório diário em Markdown — sem dependências externas.
@@ -40,11 +42,18 @@ Edite `config.json`:
 
 | Campo | Descrição |
 |---|---|
-| `controller_url` | URL base da controladora, ex.: `https://192.168.1.1` |
+| `controller_host` | Endereço da controladora, sem `https://`, ex.: `192.168.1.1` |
 | `clients_path` | Caminho da API legada. Veja **Descobrindo o site_id** abaixo. |
-| `ssid` | SSID dos coletores (exato, com distinção de maiúsculas) |
-| `alert_drops_per_hour` | Quantas quedas do mesmo MAC/hora disparam alerta (padrão: 3) |
-| `collector_macs` | Inventário opcional: `"mac": "Modelo"`. MACs em minúsculas. |
+| `ssid` | SSID dos coletores (espaços nas pontas são ignorados) |
+| `verify_tls` | `true` valida o certificado da controladora; `false` aceita certificado autoassinado |
+| `ca_file` | Opcional: caminho de um certificado de CA para validar a controladora |
+| `poll_seconds` | Intervalo do modo `loop`, em segundos (padrão: 60) |
+| `alert_drops_per_hour` | Alerta quando o mesmo MAC passa desse número de quedas na hora (padrão: 3) |
+| `collector_macs` | Inventário opcional: `"mac": "Modelo"` |
+| `ap_names` | Opcional: `"mac_da_ap": "Nome"`, já que a API legada não envia o nome da AP |
+| `state_dir` | Opcional: pasta dos dados (padrão: `dados/` ao lado do script) |
+
+Para usar outro arquivo de configuração, defina a variável `COLETORES_CONFIG` com o caminho dele.
 
 ### Descobrindo o site_id
 
@@ -69,7 +78,7 @@ python coletores_wifi_monitor.py loop
 python coletores_wifi_monitor.py report
 
 # Relatório de uma data específica
-python coletores_wifi_monitor.py report 2024-03-15
+python coletores_wifi_monitor.py report 2026-10-15
 ```
 
 ## Saídas
@@ -77,7 +86,8 @@ python coletores_wifi_monitor.py report 2024-03-15
 | Arquivo | Descrição |
 |---|---|
 | `dados/estado.json` | Estado atual dos coletores (interno) |
-| `dados/eventos.csv` | Log de todos os eventos (queda, reconexão) com timestamp, AP e RSSI |
+| `dados/eventos.csv` | Log de todos os eventos (queda, reconexão) com timestamp, AP, sinal e banda |
+| `dados/alertas_emitidos.json` | Alertas já mostrados no dia, para o modo `loop` não repetir o mesmo alerta |
 | `dados/relatorio_AAAA-MM-DD.md` | Relatório diário com top coletores afetados, quedas por hora e alertas |
 
 ### Colunas do CSV
@@ -86,11 +96,17 @@ python coletores_wifi_monitor.py report 2024-03-15
 |---|---|
 | `timestamp` | ISO 8601 (AAAA-MM-DDTHH:MM:SS) |
 | `mac` | MAC do coletor |
-| `tipo` | Urovo / Skorpio / Android (MAC aleatório) / Desconhecido |
+| `tipo` | Modelo do inventário, Urovo, Skorpio X5, Android (MAC aleatório) ou Desconhecido |
+| `origem_id` | Como o tipo foi identificado: `inventario`, `fabricante`, `nome` ou `nenhuma` |
+| `nome` | Nome ou hostname informado pela controladora |
 | `evento` | `queda`, `reconexao` ou `primeira_vez` |
-| `ap` | MAC do AP onde o coletor estava conectado |
-| `rssi` | RSSI em dBm no momento da queda |
+| `ap` | Nome da AP (pela API ou por `ap_names`) ou, na falta dele, o MAC da AP |
+| `rssi_dbm` | Potência recebida em dBm (campo `signal` da API) |
+| `snr` | Relação sinal-ruído (campo `rssi` da API legada) |
+| `banda` | Rádio usado (`ng` = 2,4 GHz, `na` = 5 GHz) |
 | `duracao_s` | Duração da queda em segundos (vazio na linha de queda; preenchido na reconexão) |
+
+Se o `eventos.csv` existente estiver no formato antigo, ele é renomeado para `eventos_legado_<data>.csv` e um novo arquivo é iniciado.
 
 ## Classificação automática
 
@@ -99,17 +115,17 @@ O agente classifica os coletores por prefixo OUI:
 | Prefixo | Modelo |
 |---|---|
 | `b4:29:3d` | Urovo |
-| `04:7b:cb` | Skorpio |
-| `3c:e1:a1` | Skorpio |
+| `04:7b:cb` | Skorpio X5 |
+| `3c:e1:a1` | Skorpio X5 |
 
-Coletores com `hostname` começando em `android-` são identificados como Android com MAC aleatório. Adicione MACs individuais ao inventário em `config.json` para identificação precisa.
+Dispositivos com MAC aleatório (bit "localmente administrado" ligado) e nome começando em `android` são identificados como Android com MAC aleatório. Adicione MACs individuais ao inventário em `config.json` para identificação precisa.
 
 ## Limitações
 
-- Polling de 60 s: quedas mais curtas que isso podem não ser detectadas. Para rastreamento exato, use os logs de eventos do UniFi em paralelo.
+- Polling a cada `poll_seconds` (60 s por padrão): quedas mais curtas que isso podem não ser detectadas. Para rastreamento exato, use os logs de eventos do UniFi em paralelo.
 - Coletores já offline quando o agente inicia não geram evento de queda; apenas a reconexão é registrada.
 - A API legada (`/stat/sta`) não é documentada oficialmente pela Ubiquiti; pode mudar em versões futuras.
-- TLS: a controladora usa certificado autoassinado por padrão; a verificação de certificado é desabilitada (sem opção de CA personalizada nesta versão).
+- TLS: a controladora usa certificado autoassinado por padrão. Prefira `verify_tls: true` com `ca_file`; use `verify_tls: false` só em rede de gerência isolada.
 
 ## Segurança
 
@@ -121,9 +137,11 @@ Coletores com `hostname` começando em `android-` são identificados como Androi
 ## Testes
 
 ```bash
-python -m unittest test_coletores_monitor -v
+python -m unittest discover -v
 ```
+
+Os testes não acessam a controladora: a API é simulada. O GitHub Actions roda a suíte a cada push e pull request, em Python 3.10 a 3.13.
 
 ## Licença
 
-MIT
+[MIT](LICENSE)
