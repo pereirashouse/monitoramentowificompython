@@ -1,26 +1,19 @@
-#!/usr/bin/env python3
 """
-Monitor de quedas Wi-Fi para coletores de dados (WMS) via API UniFi.
+Monitor de quedas Wi-Fi dos coletores (SSID configurado).
 
-Detecta em tempo quase real quando coletores do SSID configurado somem e voltam,
-registra duração, AP e RSSI em CSV e gera relatório diário em Markdown.
+Somente leitura na controladora UniFi. Usa apenas a biblioteca padrão do Python.
 
 Uso:
-  python coletores_wifi_monitor.py poll          # uma coleta
-  python coletores_wifi_monitor.py loop          # loop contínuo (Ctrl+C para parar)
-  python coletores_wifi_monitor.py report        # relatório de hoje
-  python coletores_wifi_monitor.py report 2024-03-15   # relatório de outra data
+  python coletores_wifi_monitor.py poll     -> coleta uma vez e registra eventos
+  python coletores_wifi_monitor.py report   -> gera o relatório do dia (Markdown)
+  python coletores_wifi_monitor.py loop     -> poll a cada N segundos (config)
 
-Configuração: copie config.example.json para config.json e preencha.
-Autenticação: defina a variável de ambiente UNIFI_API_KEY com a chave de API
-  (somente leitura) gerada na aplicação Network do UniFi.
-  Windows: setx UNIFI_API_KEY "sua-chave"   (reabra o terminal depois)
-  Linux/macOS: export UNIFI_API_KEY="sua-chave"
-
-Requisitos: Python 3.10+, biblioteca padrão apenas.
+Configuração: arquivo config.json ao lado do script (ver config.example.json).
+A chave da API é lida da variável de ambiente UNIFI_API_KEY (nunca do arquivo).
 """
 
 import csv
+import datetime as dt
 import json
 import os
 import ssl
@@ -28,241 +21,333 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from collections import Counter, defaultdict
-from datetime import date, datetime
-from pathlib import Path
 
-CONFIG_FILE = "config.json"
-DATA_DIR = Path("dados")
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CONFIG = os.path.join(HERE, "config.json")
 
-# Prefixos OUI públicos para classificação automática
-_OUI = {
-    "b4:29:3d": "Urovo",
-    "04:7b:cb": "Skorpio",
-    "3c:e1:a1": "Skorpio",
-}
-
-_CSV_FIELDS = ["timestamp", "mac", "tipo", "evento", "ap", "rssi", "duracao_s"]
+# Prefixos de fabricante usados para classificar os coletores
+PREFIX_URUVO = ("b4:29:3d",)
+PREFIX_SKORPIO = ("04:7b:cb", "3c:e1:a1")
 
 
-def load_config(path: str = CONFIG_FILE) -> dict:
-    with open(path) as f:
+def load_config(path=DEFAULT_CONFIG):
+    with open(path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    cfg.setdefault("ssid", "wms")
+    cfg.setdefault("poll_seconds", 60)
+    cfg.setdefault("alert_drops_per_hour", 3)
+    cfg.setdefault("verify_tls", True)
+    cfg.setdefault("state_dir", os.path.join(HERE, "dados"))
+    cfg["collector_macs"] = {m.lower(): n for m, n in cfg.get("collector_macs", {}).items()}
+    # Opcional: nome amigável das APs, pelo MAC (a API não envia o nome da AP).
+    cfg["ap_names"] = {m.lower(): n for m, n in cfg.get("ap_names", {}).items()}
+    return cfg
+
+
+def is_random_mac(mac):
+    """Bit 'locally administered' ligado = MAC aleatório (ex.: Android)."""
+    try:
+        first = int(mac.split(":")[0], 16)
+    except (ValueError, IndexError):
+        return False
+    return bool(first & 0x02)
+
+
+def classify(mac, name=""):
+    """Retorna (tipo, origem da identificação)."""
+    mac = mac.lower()
+    if mac in CONFIG_COLLECTORS:
+        return CONFIG_COLLECTORS[mac], "inventario"
+    if mac.startswith(PREFIX_URUVO):
+        return "Urovo", "fabricante"
+    if mac.startswith(PREFIX_SKORPIO):
+        return "Skorpio X5", "fabricante"
+    if is_random_mac(mac) and name.lower().startswith("android"):
+        return "Android (MAC aleatório)", "nome"
+    return "Desconhecido", "nenhuma"
+
+
+CONFIG_COLLECTORS = {}
+
+
+# ---------------------------------------------------------------- UniFi (leitura)
+
+def unifi_get_clients(cfg):
+    """Lista os clientes Wi-Fi do SSID configurado.
+
+    ATENÇÃO: o caminho do endpoint depende da versão da controladora.
+    Confirmar contra a controladora real antes de produção (ver runbook IT-INFRA-017).
+    """
+    url = f"https://{cfg['controller_host']}{cfg['clients_path']}"
+    ctx = ssl.create_default_context(cafile=cfg.get("ca_file") or None)
+    if not cfg["verify_tls"]:
+        ctx = ssl._create_unverified_context()
+    key = os.environ.get("UNIFI_API_KEY")
+    if not key:
+        raise RuntimeError("Defina a variável de ambiente UNIFI_API_KEY.")
+    req = urllib.request.Request(url, headers={"X-API-KEY": key, "Accept": "application/json"})
+    with urllib.request.urlopen(req, context=ctx, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    clients = data.get("data", data) if isinstance(data, dict) else data
+    # O SSID vem com espaços em algumas controladoras (ex.: " wms"), por isso o strip.
+    alvo = cfg["ssid"].strip()
+    return [c for c in clients if str(c.get("essid") or c.get("ssid") or "").strip() == alvo]
+
+
+def normalize(raw, ap_names=None):
+    """Converte o registro do UniFi para o formato interno do monitor.
+
+    ap_names: mapa opcional {mac_da_ap: nome}, vindo de config.json.
+    """
+    mac = (raw.get("mac") or "").lower()
+    ap_mac = (raw.get("ap_mac") or "").lower()
+    ap = (raw.get("ap_name") or raw.get("access_point_name")
+          or (ap_names or {}).get(ap_mac) or ap_mac)
+    return {
+        "mac": mac,
+        "name": raw.get("name") or raw.get("hostname") or "",
+        "ap": ap,
+        # signal = potencia recebida em dBm; rssi na API legada e a relacao sinal-ruido (SNR)
+        "rssi_dbm": raw.get("signal"),
+        "snr": raw.get("rssi"),
+        "band": raw.get("radio") or raw.get("channel_band") or "",
+    }
+
+
+# ---------------------------------------------------------------- estado e eventos
+
+def state_paths(cfg):
+    os.makedirs(cfg["state_dir"], exist_ok=True)
+    return (
+        os.path.join(cfg["state_dir"], "estado.json"),
+        os.path.join(cfg["state_dir"], "eventos.csv"),
+    )
+
+
+def load_state(path):
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
-def _ssl_ctx() -> ssl.SSLContext:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
+def save_state(path, state):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
 
 
-class CollectorMonitor:
-    """Monitora conexões Wi-Fi de coletores via API local do UniFi."""
+EVENT_FIELDS = ["timestamp", "mac", "tipo", "origem_id", "nome", "evento",
+                "ap", "rssi_dbm", "snr", "banda", "duracao_s"]
 
-    def __init__(self, config: dict) -> None:
-        self.config = config
-        self.api_url = config["controller_url"].rstrip("/") + config["clients_path"]
-        self.api_key = os.environ["UNIFI_API_KEY"]
-        self.ssid = config["ssid"]
-        self.collector_macs: dict[str, str] = {
-            k.lower(): v for k, v in config.get("collector_macs", {}).items()
-        }
-        self.alert_threshold: int = config.get("alert_drops_per_hour", 3)
-        DATA_DIR.mkdir(exist_ok=True)
-        self._state_file = DATA_DIR / "estado.json"
-        self._events_file = DATA_DIR / "eventos.csv"
-        self._state = self._load_state()
 
-    def _load_state(self) -> dict:
-        if self._state_file.exists():
-            with open(self._state_file) as f:
-                return json.load(f)
-        return {"online": {}, "last_seen": {}}
+def append_event(path, row):
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            header = next(csv.reader(f), [])
+        if header != EVENT_FIELDS:
+            # formato antigo (coluna rssi_ultimo): preserva o arquivo e começa um novo
+            stamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
+            os.replace(path, path[:-4] + "_legado_" + stamp + ".csv")
+    new = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=EVENT_FIELDS)
+        if new:
+            w.writeheader()
+        w.writerow(row)
 
-    def _save_state(self) -> None:
-        with open(self._state_file, "w") as f:
-            json.dump(self._state, f, indent=2)
 
-    def _fetch_clients(self) -> list[dict]:
-        req = urllib.request.Request(
-            self.api_url,
-            headers={"X-API-KEY": self.api_key, "Accept": "application/json"},
-        )
-        with urllib.request.urlopen(req, context=_ssl_ctx(), timeout=10) as resp:
-            raw = json.load(resp)
-        # Legacy API: {"data": [...], "meta": {"rc": "ok"}}
-        clients = raw.get("data", raw) if isinstance(raw, dict) else raw
-        return [c for c in clients if c.get("essid", "").strip() == self.ssid]
+def poll_once(cfg, clients_now, now=None):
+    """Compara a lista atual com o estado anterior e registra transições.
 
-    def _classify(self, mac: str, hostname: str) -> str:
-        mac = mac.lower()
-        if mac in self.collector_macs:
-            return self.collector_macs[mac]
-        for prefix, name in _OUI.items():
-            if mac.startswith(prefix):
-                return name
-        if hostname and hostname.startswith("android-"):
-            return "Android (MAC aleatório)"
-        return "Desconhecido"
+    clients_now: lista já normalizada (normalize()).
+    Retorna lista de eventos gerados.
+    """
+    now = now or dt.datetime.now().replace(microsecond=0)
+    state_file, events_file = state_paths(cfg)
+    state = load_state(state_file)
+    present = {c["mac"]: c for c in clients_now}
+    events = []
 
-    def _append_event(self, event: dict) -> None:
-        write_header = not self._events_file.exists()
-        with open(self._events_file, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
-            if write_header:
-                w.writeheader()
-            w.writerow(event)
-
-    def poll(self) -> list[dict]:
-        """Faz uma coleta e retorna os eventos gerados."""
-        now = datetime.now()
-        ts = now.isoformat(timespec="seconds")
-        try:
-            clients = self._fetch_clients()
-        except Exception as exc:
-            print(f"[{ts}] Falha na coleta: {exc}", file=sys.stderr)
-            return []
-
-        current = {c["mac"].lower(): c for c in clients}
-        events: list[dict] = []
-
-        for mac, info in list(self._state["online"].items()):
-            if mac not in current:
-                tipo = self._classify(mac, info.get("hostname", ""))
-                ev = {
-                    "timestamp": ts, "mac": mac, "tipo": tipo,
-                    "evento": "queda", "ap": info.get("ap", ""),
-                    "rssi": info.get("rssi", ""), "duracao_s": "",
-                }
-                self._append_event(ev)
-                events.append(ev)
-                self._state["last_seen"][mac] = {
-                    "ts": ts, "ap": info.get("ap", ""), "rssi": info.get("rssi", ""), "tipo": tipo,
-                }
-                del self._state["online"][mac]
-
-        for mac, c in current.items():
-            if mac not in self._state["online"]:
-                tipo = self._classify(mac, c.get("hostname", ""))
-                ap = c.get("ap_mac", "")
-                rssi = c.get("rssi", "")
-                ev_type = "primeira_vez" if mac not in self._state["last_seen"] else "reconexao"
-                duracao = ""
-                if ev_type == "reconexao":
-                    try:
-                        t0 = datetime.fromisoformat(self._state["last_seen"][mac]["ts"])
-                        duracao = str(int((now - t0).total_seconds()))
-                    except Exception:
-                        pass
-                ev = {
-                    "timestamp": ts, "mac": mac, "tipo": tipo,
-                    "evento": ev_type, "ap": ap, "rssi": rssi, "duracao_s": duracao,
-                }
-                self._append_event(ev)
-                events.append(ev)
-
-            self._state["online"][mac] = {
-                "ap": c.get("ap_mac", ""), "rssi": c.get("rssi", ""),
-                "hostname": c.get("hostname", ""), "tipo": self._classify(mac, c.get("hostname", "")),
+    # Clientes que estavam conectados e sumiram = queda
+    for mac, info in state.items():
+        if info.get("online") and mac not in present:
+            tipo, origem = classify(mac, info.get("name", ""))
+            ev = {
+                "timestamp": now.isoformat(), "mac": mac, "tipo": tipo,
+                "origem_id": origem, "nome": info.get("name", ""),
+                "evento": "queda", "ap": info.get("ap", ""),
+                "rssi_dbm": info.get("rssi_dbm", ""), "snr": info.get("snr", ""),
+                "banda": info.get("band", ""),
+                "duracao_s": "",
             }
+            events.append(ev)
+            info["online"] = False
+            info["queda_em"] = now.isoformat()
 
-        self._save_state()
-        return events
+    # Clientes que voltaram ou apareceram
+    for mac, c in present.items():
+        tipo, origem = classify(mac, c["name"])
+        prev = state.get(mac)
+        if prev is None or not prev.get("online"):
+            if prev and prev.get("queda_em"):
+                queda = dt.datetime.fromisoformat(prev["queda_em"])
+                dur = int((now - queda).total_seconds())
+                ev_name = "reconexao"
+            else:
+                dur = ""
+                ev_name = "primeira_vez" if prev is None else "reconexao"
+            events.append({
+                "timestamp": now.isoformat(), "mac": mac, "tipo": tipo,
+                "origem_id": origem, "nome": c["name"], "evento": ev_name,
+                "ap": c["ap"], "rssi_dbm": c.get("rssi_dbm", ""), "snr": c.get("snr", ""),
+                "banda": c["band"],
+                "duracao_s": dur,
+            })
+        state[mac] = {
+            "online": True, "name": c["name"], "ap": c["ap"],
+            "rssi_dbm": c.get("rssi_dbm", ""), "snr": c.get("snr", ""),
+            "band": c["band"], "last_seen": now.isoformat(),
+            "queda_em": None,  # limpa a marca de queda após a reconexão
+        }
 
-    def loop(self, interval: int = 60) -> None:
-        """Loop contínuo de coleta. Pressione Ctrl+C para parar."""
-        print(f"Monitor iniciado — coleta a cada {interval}s. Ctrl+C para parar.")
-        while True:
-            events = self.poll()
-            drops = [e for e in events if e["evento"] == "queda"]
-            print(f"{datetime.now().strftime('%H:%M:%S')} — {len(events)} evento(s), {len(drops)} queda(s)")
-            for e in drops:
-                print(f"  ALERTA queda: {e['mac']} ({e['tipo']})  AP={e['ap']}  RSSI={e['rssi']}")
-            time.sleep(interval)
-
-    def report(self, report_date: "date | str | None" = None) -> Path:
-        """Gera relatório diário em Markdown."""
-        if report_date is None:
-            report_date = date.today()
-        elif isinstance(report_date, str):
-            report_date = date.fromisoformat(report_date)
-
-        date_str = report_date.isoformat()
-        events: list[dict] = []
-        if self._events_file.exists():
-            with open(self._events_file, encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    if row["timestamp"].startswith(date_str):
-                        events.append(row)
-
-        drops = [e for e in events if e["evento"] == "queda"]
-        drops_by_mac = Counter(e["mac"] for e in drops)
-        drops_by_tipo = Counter(e["tipo"] for e in drops)
-        drops_by_hour = Counter(e["timestamp"][11:13] for e in drops)
-
-        mac_hour_count: dict[tuple, int] = defaultdict(int)
-        for e in drops:
-            mac_hour_count[(e["mac"], e["timestamp"][11:13])] += 1
-        alerts = [(mac, h, n) for (mac, h), n in mac_hour_count.items() if n > self.alert_threshold]
-
-        lines = [
-            f"# Relatório de quedas Wi-Fi — {date_str}",
-            "",
-            f"**Total de quedas:** {len(drops)}  |  **Total de eventos:** {len(events)}",
-            "",
-            "## Quedas por tipo",
-            "",
-        ]
-        for tipo, n in drops_by_tipo.most_common():
-            lines.append(f"- {tipo}: {n}")
-
-        lines += ["", "## Coletores mais afetados (top 10)", ""]
-        for mac, n in drops_by_mac.most_common(10):
-            tipo = next((e["tipo"] for e in drops if e["mac"] == mac), "")
-            lines.append(f"- `{mac}` ({tipo}): {n} queda(s)")
-
-        lines += ["", "## Quedas por hora", ""]
-        for h in sorted(drops_by_hour):
-            lines.append(f"- {h}h: {drops_by_hour[h]}")
-
-        if alerts:
-            lines += ["", "## ⚠️ Alertas", ""]
-            for mac, h, n in sorted(alerts, key=lambda x: -x[2]):
-                lines.append(f"- `{mac}` teve **{n} quedas** na hora {h}h (limite: {self.alert_threshold})")
-
-        report_path = DATA_DIR / f"relatorio_{date_str}.md"
-        report_path.write_text("\n".join(lines), encoding="utf-8")
-        print(f"Relatório gerado: {report_path}")
-        return report_path
+    for ev in events:
+        append_event(events_file, ev)
+    save_state(state_file, state)
+    return events
 
 
-def main() -> None:
-    try:
-        config = load_config()
-    except FileNotFoundError:
-        print(f"Arquivo {CONFIG_FILE!r} não encontrado. Copie config.example.json e preencha.", file=sys.stderr)
-        sys.exit(1)
+# ---------------------------------------------------------------- relatório e alerta
 
-    if "UNIFI_API_KEY" not in os.environ:
-        print("Variável UNIFI_API_KEY não definida. Veja o README.", file=sys.stderr)
-        sys.exit(1)
+def read_events(cfg):
+    _, events_file = state_paths(cfg)
+    if not os.path.exists(events_file):
+        return []
+    with open(events_file, encoding="utf-8") as f:
+        return list(csv.DictReader(f))
 
-    monitor = CollectorMonitor(config)
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "poll"
+
+def drops_per_hour(events, day):
+    """Conta quedas por MAC por hora, para um dia (YYYY-MM-DD)."""
+    counts = {}
+    for e in events:
+        if e["evento"] != "queda" or not e["timestamp"].startswith(day):
+            continue
+        hora = e["timestamp"][11:13]
+        key = (e["mac"], hora)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def alerts_for(cfg, events, day):
+    limite = cfg["alert_drops_per_hour"]
+    return [(mac, hora, n) for (mac, hora), n in sorted(drops_per_hour(events, day).items())
+            if n > limite]
+
+
+def build_report(cfg, day):
+    events = read_events(cfg)
+    dia = [e for e in events if e["timestamp"].startswith(day)]
+    quedas = [e for e in dia if e["evento"] == "queda"]
+    por_tipo = {}
+    for e in quedas:
+        por_tipo[e["tipo"]] = por_tipo.get(e["tipo"], 0) + 1
+    por_mac = {}
+    for e in quedas:
+        por_mac.setdefault(e["mac"], {"nome": e["nome"], "tipo": e["tipo"], "n": 0})["n"] += 1
+    top = sorted(por_mac.items(), key=lambda x: -x[1]["n"])[:10]
+    alertas = alerts_for(cfg, events, day)
+
+    linhas = [
+        f"# Relatório de quedas dos coletores (SSID {cfg['ssid']}) - {day}",
+        "",
+        f"- Quedas no dia: **{len(quedas)}**",
+        f"- Coletores com queda: **{len(por_mac)}**",
+        "",
+        "## Quedas por tipo",
+        "",
+        "| Tipo | Quedas |",
+        "|---|---|",
+    ]
+    linhas += [f"| {t} | {n} |" for t, n in sorted(por_tipo.items(), key=lambda x: -x[1])] or ["| - | 0 |"]
+    linhas += ["", "## Coletores mais afetados (top 10)", "", "| MAC | Nome | Tipo | Quedas |", "|---|---|---|---|"]
+    linhas += [f"| {mac} | {v['nome']} | {v['tipo']} | {v['n']} |" for mac, v in top] or ["| - | - | - | 0 |"]
+    linhas += ["", f"## Alertas (mais de {cfg['alert_drops_per_hour']} quedas por hora)", ""]
+    linhas += [f"- {mac} às {hora}h: {n} quedas" for mac, hora, n in alertas] or ["- Nenhum alerta no dia."]
+    return "\n".join(linhas) + "\n"
+
+
+def write_report(cfg, day):
+    text = build_report(cfg, day)
+    path = os.path.join(cfg["state_dir"], f"relatorio_{day}.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+# ---------------------------------------------------------------- execução
+
+def alert_registry_path(cfg):
+    os.makedirs(cfg["state_dir"], exist_ok=True)
+    return os.path.join(cfg["state_dir"], "alertas_emitidos.json")
+
+
+def pending_alerts(cfg, alertas, day):
+    """Devolve só os alertas (MAC, hora) ainda não emitidos no dia.
+
+    Sem isso, no modo loop o mesmo alerta seria impresso a cada ciclo.
+    """
+    path = alert_registry_path(cfg)
+    emitidos = set()
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            emitidos = set(json.load(f))
+    novos = [(mac, hora, n) for mac, hora, n in alertas if f"{day}|{mac}|{hora}" not in emitidos]
+    emitidos.update(f"{day}|{mac}|{hora}" for mac, hora, _ in novos)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(sorted(emitidos), f, indent=1)
+    return novos
+
+
+def run_poll(cfg):
+    raw = unifi_get_clients(cfg)
+    clients = [normalize(r, cfg.get("ap_names")) for r in raw if r.get("mac")]
+    events = poll_once(cfg, clients)
+    hoje = dt.date.today().isoformat()
+    alertas = pending_alerts(cfg, alerts_for(cfg, read_events(cfg), hoje), hoje)
+    return events, alertas
+
+
+def main(argv):
+    global CONFIG_COLLECTORS
+    cfg = load_config(os.environ.get("COLETORES_CONFIG", DEFAULT_CONFIG))
+    CONFIG_COLLECTORS = cfg["collector_macs"]
+    cmd = argv[1] if len(argv) > 1 else "poll"
 
     if cmd == "poll":
-        events = monitor.poll()
-        print(f"{len(events)} evento(s)")
+        events, alertas = run_poll(cfg)
+        print(f"{len(events)} evento(s) registrado(s).")
+        for mac, hora, n in alertas:
+            print(f"ALERTA: {mac} com {n} quedas na hora {hora}h")
     elif cmd == "loop":
-        monitor.loop()
+        while True:
+            try:
+                events, alertas = run_poll(cfg)
+                print(dt.datetime.now().isoformat(), f"{len(events)} evento(s)", flush=True)
+                for mac, hora, n in alertas:
+                    print(f"ALERTA: {mac} com {n} quedas na hora {hora}h", flush=True)
+            except Exception as exc:  # qualquer falha de coleta nao derruba o loop
+                print("Falha na coleta:", exc, flush=True)
+            time.sleep(cfg["poll_seconds"])
     elif cmd == "report":
-        d = sys.argv[2] if len(sys.argv) > 2 else None
-        monitor.report(d)
+        day = argv[2] if len(argv) > 2 else dt.date.today().isoformat()
+        print(write_report(cfg, day))
     else:
-        print(f"Uso: python {sys.argv[0]} [poll|loop|report [AAAA-MM-DD]]")
-        sys.exit(1)
+        print(__doc__)
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(sys.argv))
