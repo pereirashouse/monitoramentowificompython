@@ -16,6 +16,8 @@ import csv
 import datetime as dt
 import json
 import os
+import random
+import socket
 import ssl
 import sys
 import time
@@ -39,6 +41,10 @@ def load_config(path=DEFAULT_CONFIG):
     cfg.setdefault("alert_drops_per_hour", 3)
     cfg.setdefault("verify_tls", True)
     validate_tls_options(cfg)
+    cfg.setdefault("retry_max_attempts", 3)
+    cfg.setdefault("retry_backoff_seconds", 2)
+    cfg.setdefault("retry_max_delay_seconds", 30)
+    validate_retry_options(cfg)
     cfg.setdefault("state_dir", os.path.join(HERE, "dados"))
     cfg["collector_macs"] = {m.lower(): n for m, n in cfg.get("collector_macs", {}).items()}
     # Opcional: nome amigável das APs, pelo MAC (a API não envia o nome da AP).
@@ -142,7 +148,59 @@ def parse_unifi_clients(data):
     return wireless
 
 
+def validate_retry_options(cfg):
+    """Limita tentativas e pausas; uma tentativa desativa as retentativas."""
+    attempts = cfg.get("retry_max_attempts", 3)
+    base = cfg.get("retry_backoff_seconds", 2)
+    cap = cfg.get("retry_max_delay_seconds", 30)
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or not 1 <= attempts <= 5:
+        raise ValueError("retry_max_attempts deve ser um inteiro de 1 a 5, incluindo a primeira tentativa.")
+    for name, value in (("retry_backoff_seconds", base), ("retry_max_delay_seconds", cap)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 300:
+            raise ValueError(f"{name} deve ser um número maior que zero e no máximo 300 segundos.")
+    if cap < base:
+        raise ValueError("retry_max_delay_seconds deve ser maior ou igual a retry_backoff_seconds.")
+    return attempts, float(base), float(cap)
+
+
+def is_retryable_collection_error(error):
+    """Política conservadora para GET: nunca repete TLS, credenciais ou dados."""
+    if isinstance(error, urllib.error.HTTPError):
+        if error.headers is not None and error.headers.get("Retry-After"):
+            return False
+        return error.code in (408, 500, 502, 503, 504)
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(reason, ssl.SSLError):
+        return False
+    if isinstance(reason, socket.gaierror):
+        return reason.errno == socket.EAI_AGAIN
+    return isinstance(reason, (TimeoutError, ConnectionError))
+
+
 def unifi_get_clients(cfg):
+    """Coleta uma amostra validada, com retentativas limitadas e sem gravação."""
+    attempts, base, cap = validate_retry_options(cfg)
+    for attempt in range(1, attempts + 1):
+        try:
+            return _unifi_get_clients_once(cfg)
+        except (urllib.error.URLError, TimeoutError, ConnectionError, socket.gaierror) as exc:
+            if attempt == attempts or not is_retryable_collection_error(exc):
+                raise
+            # Libera a resposta HTTP de erro antes de abrir outra conexão.
+            if isinstance(exc, urllib.error.HTTPError):
+                exc.close()
+            nominal = min(base * (2 ** (attempt - 1)), cap)
+            delay = random.uniform(nominal / 2, nominal)
+            warnings.warn(
+                f"Falha temporária na coleta. Retentativa {attempt + 1}/{attempts} "
+                f"em {delay:.3f}s; estado preservado.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            time.sleep(delay)
+
+
+def _unifi_get_clients_once(cfg):
     """Lista os clientes Wi-Fi do SSID configurado.
 
     ATENÇÃO: o caminho do endpoint depende da versão da controladora.

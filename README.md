@@ -98,6 +98,9 @@ setx UNIFI_API_KEY "sua-chave"
 | `verify_tls` | Booleano JSON; padrão `true`. Valida certificado e hostname. `false` desativa ambas as verificações e emite aviso de risco; somente para diagnóstico temporário em laboratório isolado. |
 | `ca_file` | Opcional: caminho de um arquivo PEM com a CA confiável. `null`, vazio ou omitido usa as CAs padrão carregadas pelo Python. Caminho relativo é resolvido a partir do diretório de execução; prefira caminho absoluto. |
 | `poll_seconds` | Intervalo do modo `loop`, em segundos (padrão: 60) |
+| `retry_max_attempts` | Tentativas totais por coleta, incluindo a primeira; inteiro de 1 a 5, padrão 3. Use 1 para desativar as retentativas. |
+| `retry_backoff_seconds` | Base do backoff exponencial, padrão 2 s. Número maior que zero e no máximo 300 s. |
+| `retry_max_delay_seconds` | Teto de cada pausa entre tentativas, padrão 30 s. Número maior que zero e no máximo 300 s, não menor que a base. |
 | `alert_drops_per_hour` | Alerta quando o mesmo MAC passa desse número de quedas na hora (padrão: 3) |
 | `collector_macs` | Inventário opcional: `"mac": "Modelo"` |
 | `ap_names` | Opcional: `"mac_da_ap": "Nome"`, já que a API legada não envia o nome da AP |
@@ -145,7 +148,7 @@ Procure o campo `internalReference` do seu site e substitua em `clients_path`:
 # Uma coleta imediata
 python coletores_wifi_monitor.py poll
 
-# Loop contínuo (uma coleta por minuto)
+# Loop contínuo (pausa padrão de 60 s após cada ciclo)
 python coletores_wifi_monitor.py loop
 
 # Relatório do dia atual
@@ -161,7 +164,7 @@ python coletores_wifi_monitor.py report 2026-10-15
 python -m unittest discover -v
 ```
 
-Os testes não acessam a controladora: a API é simulada. A suíte cobre respostas JSON/UTF-8 inválidas, formatos inesperados, erros explícitos da API, HTTP 401/403/429/500/503, timeout na conexão/leitura e preservação de estado, CSV e alertas após uma falha. A suíte TLS verifica o padrão seguro, o uso de CA, a rejeição de opções ambíguas, o aviso no modo inseguro e a propagação de erros sem fallback. Os contextos SSL são inspecionados, mas a suíte não substitui uma validação ponta a ponta contra a controladora.
+Os testes não acessam a controladora: a API é simulada. A suíte cobre respostas JSON/UTF-8 inválidas, formatos inesperados, erros explícitos da API, falhas HTTP, timeout na conexão/leitura e preservação de estado, CSV e alertas após uma falha. Os testes de retentativas simulam também a espera e a variação aleatória, verificando limites, recuperação e ausência de novas tentativas para erros não transitórios. A suíte TLS verifica o padrão seguro, o uso de CA, a rejeição de opções ambíguas, o aviso no modo inseguro e a propagação de erros sem fallback. Os contextos SSL são inspecionados, mas a suíte não substitui uma validação ponta a ponta contra a controladora.
 
 ### Falha de coleta não é queda de coletor
 
@@ -169,9 +172,21 @@ Antes de atualizar estado ou eventos, o monitor valida a amostra inteira. Aceita
 
 Uma lista vazia **válida** continua significando que não há clientes do SSID naquela amostra e pode gerar eventos de queda para quem estava online. Já uma resposta sem `data`, JSON malformado, erro da API ou timeout não significa lista vazia: a exceção é propagada antes de gravar `estado.json`, `eventos.csv` ou `alertas_emitidos.json`. Os testes comparam os bytes desses arquivos antes e depois das falhas simuladas. Se a primeira coleta falhar, ela nem cria a pasta de dados.
 
-No comando `poll`, o erro interrompe a execução com status de falha. No modo `loop`, a mensagem `Falha na coleta` é exibida e o próximo ciclo é tentado após `poll_seconds`, sem trocar a política TLS. Se o coletor continuar presente na amostra válida seguinte, não é inventada uma queda ou reconexão para preencher a lacuna. A ausência de eventos durante uma falha **não comprova disponibilidade**: o intervalo ficou sem observação.
+No comando `poll`, um erro não repetível ou o esgotamento das tentativas interrompe a execução com status de falha. No modo `loop`, a mensagem `Falha na coleta` é exibida e o próximo ciclo é tentado após `poll_seconds`, sem trocar a política TLS. Se o coletor continuar presente na amostra válida seguinte, não é inventada uma queda ou reconexão para preencher a lacuna. A ausência de eventos durante uma falha **não comprova disponibilidade**: o intervalo ficou sem observação.
 
-O timeout de 20 segundos é aplicado pelo `urlopen` às operações de rede; não é um prazo total garantido para o ciclo inteiro. Esta etapa não adiciona retentativas imediatas, backoff ou rotação de arquivos. A validação exige o formato descrito: se outra versão da API omitir o SSID ou representar clientes cabeados de outra maneira, confirme e adapte o contrato antes de usar a coleta; não converta uma resposta desconhecida em ausência de clientes.
+O timeout de 20 segundos é aplicado pelo `urlopen` às operações de rede; não é um prazo total garantido para o ciclo inteiro. A validação exige o formato descrito: se outra versão da API omitir o SSID ou representar clientes cabeados de outra maneira, confirme e adapte o contrato antes de usar a coleta; não converta uma resposta desconhecida em ausência de clientes.
+
+### Retentativas limitadas com backoff
+
+Por padrão, uma coleta pode realizar **até três tentativas totais**, apenas de leitura (GET). São repetíveis timeout, falhas de conexão, DNS temporário (`EAI_AGAIN`) e HTTP 408/500/502/503/504 sem `Retry-After`. Antes de repetir, a resposta HTTP de erro é fechada, um aviso genérico é emitido e há uma pausa. O aviso não inclui a chave de API nem o corpo ou motivo devolvido pelo servidor.
+
+A pausa nominal dobra a partir de `retry_backoff_seconds`, respeitando `retry_max_delay_seconds`. A espera efetiva é sorteada entre metade e o total dessa pausa (jitter), para reduzir a sincronização entre monitores. Com os padrões, a primeira espera fica entre 1 e 2 s e a segunda entre 2 e 4 s; não há espera adicional depois da última tentativa. As opções aceitam apenas números finitos dentro dos limites da tabela. Use `retry_max_attempts: 1` para manter uma única tentativa.
+
+Não há retentativa dentro da mesma coleta para HTTP 401/403/429, outros códigos fora da lista, respostas com `Retry-After`, DNS permanente ou motivo de rede desconhecido. Também não são repetidos erros TLS, configuração inválida, chave ausente, JSON/UTF-8 malformado e falha de validação da amostra. A verificação TLS nunca é desligada para recuperar uma coleta.
+
+HTTP 429 e `Retry-After` encerram o ciclo sem novas requisições imediatas; o modo `loop` ainda usa `poll_seconds` para o ciclo seguinte e **não implementa um agendador que respeite automaticamente um prazo maior indicado pelo servidor**. Se isso ocorrer, interrompa o loop e ajuste a frequência segundo a política da API antes de continuar. Essa política conservadora não é um limitador global de requisições.
+
+Durante as tentativas, os arquivos de estado e eventos permanecem inalterados. Se uma tentativa recuperar uma amostra válida, ela é processada uma vez; se todas falharem, o erro final é propagado e o estado anterior é preservado. As pausas e o tempo das requisições aumentam o intervalo entre amostras. Esta etapa não adiciona rotação de CSV, concorrência ou registro separado de lacunas.
 
 ## Exemplo de uso
 

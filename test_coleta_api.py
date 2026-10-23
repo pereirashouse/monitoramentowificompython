@@ -29,7 +29,7 @@ class ApiTests(unittest.TestCase):
         self.cfg = {
             "controller_host": "unifi.example.invalid",
             "clients_path": "/proxy/network/api/s/testsite/stat/sta",
-            "ssid": "wms", "verify_tls": True,
+            "ssid": "wms", "verify_tls": True, "retry_max_attempts": 1,
         }
         env = patch.dict(os.environ, {"UNIFI_API_KEY": "chave-ficticia-de-teste"})
         env.start()
@@ -139,6 +139,7 @@ class CollectionStateTests(unittest.TestCase):
             "controller_host": "unifi.example.invalid",
             "clients_path": "/proxy/network/api/s/testsite/stat/sta",
             "ssid": "wms", "verify_tls": True,
+            "retry_max_attempts": 1,
             "state_dir": str(self.folder), "poll_seconds": 60,
             "alert_drops_per_hour": 3, "collector_macs": {}, "ap_names": {},
         }
@@ -177,7 +178,7 @@ class CollectionStateTests(unittest.TestCase):
     def test_ssid_ausente_nao_vira_ausencia_de_cliente(self):
         self.assert_failed_snapshot({"data": [{"mac": RAW_CLIENT["mac"]}]})
 
-    def test_erro_http_preserva_arquivos_e_nao_retenta_nesta_etapa(self):
+    def test_erro_http_preserva_arquivos_com_retentativas_desativadas(self):
         for code in (401, 403, 429, 500, 503):
             with self.subTest(code=code):
                 error = urllib.error.HTTPError("https://unifi.example.invalid", code, "erro ficticio", {}, None)
