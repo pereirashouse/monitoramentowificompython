@@ -104,6 +104,44 @@ def create_tls_context(cfg):
     return ctx
 
 
+class UnifiResponseError(ValueError):
+    """Resposta da API inválida; não deve ser tratada como lista vazia."""
+
+
+def parse_unifi_clients(data):
+    """Valida toda a amostra e retorna os registros Wi-Fi, sem gravar estado."""
+    if isinstance(data, dict):
+        if data.get("error"):
+            raise UnifiResponseError("A API UniFi retornou um erro explícito.")
+        if "meta" in data:
+            meta = data["meta"]
+            if not isinstance(meta, dict) or meta.get("rc") != "ok":
+                raise UnifiResponseError("A API UniFi não confirmou sucesso em meta.rc.")
+        if "data" not in data:
+            raise UnifiResponseError("Resposta UniFi sem a lista data.")
+        clients = data["data"]
+    else:
+        clients = data
+    if not isinstance(clients, list):
+        raise UnifiResponseError("A resposta UniFi deve conter uma lista de clientes.")
+
+    wireless = []
+    for index, client in enumerate(clients):
+        if not isinstance(client, dict):
+            raise UnifiResponseError(f"Registro UniFi {index}: esperado um objeto.")
+        mac = client.get("mac")
+        if not isinstance(mac, str) or not mac.strip():
+            raise UnifiResponseError(f"Registro UniFi {index}: mac ausente ou inválido.")
+        # A API legada também retorna clientes cabeados; não pertencem ao SSID.
+        if client.get("is_wired") is True:
+            continue
+        ssid = client.get("essid") or client.get("ssid")
+        if not isinstance(ssid, str) or not ssid.strip():
+            raise UnifiResponseError(f"Registro UniFi {index}: SSID ausente ou inválido.")
+        wireless.append(client)
+    return wireless
+
+
 def unifi_get_clients(cfg):
     """Lista os clientes Wi-Fi do SSID configurado.
 
@@ -118,10 +156,10 @@ def unifi_get_clients(cfg):
     req = urllib.request.Request(url, headers={"X-API-KEY": key, "Accept": "application/json"})
     with urllib.request.urlopen(req, context=ctx, timeout=20) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-    clients = data.get("data", data) if isinstance(data, dict) else data
+    clients = parse_unifi_clients(data)
     # O SSID vem com espaços em algumas controladoras (ex.: " wms"), por isso o strip.
     alvo = cfg["ssid"].strip()
-    return [c for c in clients if str(c.get("essid") or c.get("ssid") or "").strip() == alvo]
+    return [c for c in clients if (c.get("essid") or c.get("ssid")).strip() == alvo]
 
 
 def normalize(raw, ap_names=None):
@@ -342,7 +380,8 @@ def pending_alerts(cfg, alertas, day):
 
 def run_poll(cfg):
     raw = unifi_get_clients(cfg)
-    clients = [normalize(r, cfg.get("ap_names")) for r in raw if r.get("mac")]
+    # Só uma amostra validada pode chegar à gravação de estado e eventos.
+    clients = [normalize(r, cfg.get("ap_names")) for r in raw]
     events = poll_once(cfg, clients)
     hoje = dt.date.today().isoformat()
     alertas = pending_alerts(cfg, alerts_for(cfg, read_events(cfg), hoje), hoje)

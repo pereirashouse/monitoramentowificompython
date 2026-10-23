@@ -161,7 +161,17 @@ python coletores_wifi_monitor.py report 2026-10-15
 python -m unittest discover -v
 ```
 
-Os testes não acessam a controladora: a API é simulada. A suíte TLS verifica o padrão seguro, o uso de CA, a rejeição de opções ambíguas, o aviso no modo inseguro e a propagação de erros sem fallback. Os contextos SSL são inspecionados, mas a suíte não substitui uma validação ponta a ponta contra o certificado da sua controladora.
+Os testes não acessam a controladora: a API é simulada. A suíte cobre respostas JSON/UTF-8 inválidas, formatos inesperados, erros explícitos da API, HTTP 401/403/429/500/503, timeout na conexão/leitura e preservação de estado, CSV e alertas após uma falha. A suíte TLS verifica o padrão seguro, o uso de CA, a rejeição de opções ambíguas, o aviso no modo inseguro e a propagação de erros sem fallback. Os contextos SSL são inspecionados, mas a suíte não substitui uma validação ponta a ponta contra a controladora.
+
+### Falha de coleta não é queda de coletor
+
+Antes de atualizar estado ou eventos, o monitor valida a amostra inteira. Aceita uma lista direta de registros ou um objeto com `data` contendo essa lista. Se houver `meta`, ele deve confirmar `rc: "ok"`; um campo `error` com conteúdo também interrompe a coleta. Cada registro precisa de um `mac` textual não vazio. Registros Wi-Fi precisam de `essid` ou `ssid` textual não vazio; clientes explicitamente cabeados (`is_wired: true`) são ignorados depois da validação do MAC. Um registro inválido, mesmo de outro SSID, invalida a amostra: ele não é descartado silenciosamente para produzir uma lista parcial.
+
+Uma lista vazia **válida** continua significando que não há clientes do SSID naquela amostra e pode gerar eventos de queda para quem estava online. Já uma resposta sem `data`, JSON malformado, erro da API ou timeout não significa lista vazia: a exceção é propagada antes de gravar `estado.json`, `eventos.csv` ou `alertas_emitidos.json`. Os testes comparam os bytes desses arquivos antes e depois das falhas simuladas. Se a primeira coleta falhar, ela nem cria a pasta de dados.
+
+No comando `poll`, o erro interrompe a execução com status de falha. No modo `loop`, a mensagem `Falha na coleta` é exibida e o próximo ciclo é tentado após `poll_seconds`, sem trocar a política TLS. Se o coletor continuar presente na amostra válida seguinte, não é inventada uma queda ou reconexão para preencher a lacuna. A ausência de eventos durante uma falha **não comprova disponibilidade**: o intervalo ficou sem observação.
+
+O timeout de 20 segundos é aplicado pelo `urlopen` às operações de rede; não é um prazo total garantido para o ciclo inteiro. Esta etapa não adiciona retentativas imediatas, backoff ou rotação de arquivos. A validação exige o formato descrito: se outra versão da API omitir o SSID ou representar clientes cabeados de outra maneira, confirme e adapte o contrato antes de usar a coleta; não converta uma resposta desconhecida em ausência de clientes.
 
 ## Exemplo de uso
 
@@ -259,8 +269,8 @@ Dispositivos com MAC aleatório (bit "localmente administrado" ligado) e nome co
 
 ## Limitações
 
-- **Amostragem por polling.** Com coleta a cada 60 s, quedas mais curtas que o intervalo podem passar despercebidas, e a duração medida tem a precisão do intervalo. Para rastreamento exato, use os logs de eventos do UniFi em paralelo.
-- **Lacunas do próprio monitor.** Se o script parar (máquina desligada, falha de rede até a controladora), a próxima reconexão aparece com uma duração enorme. No relatório de exemplo, essas quedas estão marcadas como "possível lacuna".
+- **Amostragem por polling.** Só são observadas as transições presentes nas amostras válidas. Em um exemplo fictício, um cliente online às 10h00 e às 10h01 pode ter caído e voltado entre esses horários sem gerar evento. Reduzir o intervalo pode melhorar a chance de detecção, mas não garante captar toda queda. O modo `loop` espera 60 s por padrão depois de cada ciclo, além do tempo gasto na coleta; a duração registrada é uma estimativa entre observações, não a duração exata no rádio. Correlacione com os logs de eventos do UniFi.
+- **Lacunas do próprio monitor.** Erros de coleta não alteram os arquivos nem são tratados como queda de todos os clientes. Ainda assim, o intervalo sem amostra válida é desconhecido. Se um coletor já estava marcado como offline, o tempo até a próxima reconexão pode incluir a parada do monitor. No relatório de exemplo, essas quedas estão marcadas como "possível lacuna"; a execução não produz ainda um registro separado de lacunas.
 - **Início a frio.** Coletores já offline quando o monitor inicia não geram evento de queda; só a reconexão é registrada.
 - **API não documentada.** A API legada (`/stat/sta`) não é documentada oficialmente pela Ubiquiti e pode mudar em versões futuras.
 - **Só UniFi.** Outras controladoras (Aruba, Omada, Cisco) precisariam de um novo `unifi_get_clients`.
