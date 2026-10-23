@@ -171,7 +171,7 @@ Os testes não acessam a controladora: a API é simulada. A suíte cobre respost
 
 Antes de atualizar estado ou eventos, o monitor valida a amostra inteira. Aceita uma lista direta de registros ou um objeto com `data` contendo essa lista. Se houver `meta`, ele deve confirmar `rc: "ok"`; um campo `error` com conteúdo também interrompe a coleta. Cada registro precisa de um `mac` textual não vazio. Registros Wi-Fi precisam de `essid` ou `ssid` textual não vazio; clientes explicitamente cabeados (`is_wired: true`) são ignorados depois da validação do MAC. Um registro inválido, mesmo de outro SSID, invalida a amostra: ele não é descartado silenciosamente para produzir uma lista parcial.
 
-Uma lista vazia **válida** continua significando que não há clientes do SSID naquela amostra e pode gerar eventos de queda para quem estava online. Já uma resposta sem `data`, JSON malformado, erro da API ou timeout não significa lista vazia: a exceção é propagada antes de gravar `estado.json`, `eventos.csv` ou `alertas_emitidos.json`. Os testes comparam os bytes desses arquivos antes e depois das falhas simuladas. Se a primeira coleta falhar, ela nem cria a pasta de dados.
+Uma lista vazia **válida** continua significando que não há clientes do SSID naquela amostra e pode gerar eventos de queda para quem estava online. Já uma resposta sem `data`, JSON malformado, erro da API ou timeout não significa lista vazia: a exceção é propagada antes de gravar `estado.json`, `eventos.csv` ou `alertas_emitidos.json`. Os testes comparam os bytes desses arquivos antes e depois das falhas simuladas. O bloqueio é adquirido antes da requisição: mesmo se a primeira coleta falhar, a pasta e o arquivo técnico `.monitor.lock` podem existir, mas não são criados estado, CSV ou alertas por essa falha.
 
 No comando `poll`, um erro não repetível ou o esgotamento das tentativas interrompe a execução com status de falha. No modo `loop`, a mensagem `Falha na coleta` é exibida e o próximo ciclo é tentado após `poll_seconds`, sem trocar a política TLS. Se o coletor continuar presente na amostra válida seguinte, não é inventada uma queda ou reconexão para preencher a lacuna. A ausência de eventos durante uma falha **não comprova disponibilidade**: o intervalo ficou sem observação.
 
@@ -187,7 +187,7 @@ Não há retentativa dentro da mesma coleta para HTTP 401/403/429, outros códig
 
 HTTP 429 e `Retry-After` encerram o ciclo sem novas requisições imediatas; o modo `loop` ainda usa `poll_seconds` para o ciclo seguinte e **não implementa um agendador que respeite automaticamente um prazo maior indicado pelo servidor**. Se isso ocorrer, interrompa o loop e ajuste a frequência segundo a política da API antes de continuar. Essa política conservadora não é um limitador global de requisições.
 
-Durante as tentativas, os arquivos de estado e eventos permanecem inalterados. Se uma tentativa recuperar uma amostra válida, ela é processada uma vez; se todas falharem, o erro final é propagado e o estado anterior é preservado. As pausas e o tempo das requisições aumentam o intervalo entre amostras. Concorrência e registro separado de lacunas ainda não são implementados.
+Durante as tentativas, os arquivos de estado e eventos permanecem inalterados. Se uma tentativa recuperar uma amostra válida, ela é processada uma vez; se todas falharem, o erro final é propagado e o estado anterior é preservado. As pausas e o tempo das requisições aumentam o intervalo entre amostras. O bloqueio da pasta permanece ativo nas retentativas; registro separado de lacunas ainda não é implementado.
 
 ## Exemplo de uso
 
@@ -250,6 +250,7 @@ Cenário fictício: um Urovo na antena "Expedição - 1" com sinal fraco (-71 dB
 | `dados/eventos_legado_<data>_<id>.csv` | Formatos antigos preservados separadamente; não são convertidos nem incluídos automaticamente nos relatórios |
 | `dados/alertas_emitidos.json` | Alertas já mostrados no dia, para o modo `loop` não repetir o mesmo alerta |
 | `dados/relatorio_AAAA-MM-DD.md` | Relatório diário com top coletores afetados, quedas por hora e alertas |
+| `dados/.monitor.lock` | Arquivo técnico persistente usado pelo bloqueio do sistema operacional; sua existência não significa que há execução ativa |
 
 ### Rotação do CSV sem exclusão de histórico
 
@@ -261,7 +262,19 @@ O limite é um alvo por arquivo, não um teto rígido: o primeiro evento de um a
 
 Essa rotação limita o tamanho do **arquivo ativo**, mas não o uso total de disco nem o consumo de memória: os relatórios ainda carregam todo o histórico atual. Planeje backup e arquivamento externo conforme a necessidade; remover arquivos da pasta de dados reduz o período disponível nos relatórios. Com o monitor parado, copie `eventos.csv`, os arquivos rotacionados, `estado.json` e `alertas_emitidos.json` para preservar o conjunto consistente. Os testes desta etapa usam dados fictícios e não equivalem a validação de backup/restauração em produção.
 
-Use **um único processo escritor por `state_dir`** e pare-o antes de manipular ou gerar relatórios durante uma rotação. Não há bloqueio entre processos nem transação conjunta entre CSV e estado. Falhas de disco, interrupção entre gravações ou execução concorrente precisam de recuperação operacional; esta etapa não promete ausência de perda/duplicação nesses cenários. Os testes verificam rotação normal, UTF-8, nomes exclusivos, preservação de bytes, histórico sem duplicação e relatórios/alertas equivalentes antes e depois da rotação.
+Há bloqueio exclusivo por `state_dir` nas operações cooperantes, descrito abaixo. Não há transação conjunta entre CSV e estado: falhas de disco ou interrupção entre gravações ainda precisam de recuperação operacional, e não há promessa de ausência de perda/duplicação nesses cenários. Os testes de rotação verificam UTF-8, nomes exclusivos, preservação de bytes, histórico sem duplicação no fluxo normal e relatórios/alertas equivalentes antes e depois da rotação.
+
+### Controle de concorrência e execução única
+
+Os comandos `poll`, `loop` e `report` adquirem um bloqueio exclusivo e não bloqueante da pasta de dados antes de operar. No `loop`, ele permanece ativo durante toda a execução, inclusive requisições, retentativas e pausas entre ciclos. Uma segunda execução na mesma pasta termina com a mensagem `Pasta de dados ocupada` e **status de saída 3**, sem consultar a API nem gravar dados. Para gerar relatório de um loop em execução, encerre-o primeiro, execute `report` e depois reinicie o loop. Pastas distintas podem ser usadas de forma independente.
+
+O bloqueio usa `flock` em POSIX e bloqueio de um byte via `msvcrt` no Windows, apenas da biblioteca padrão. A pasta é identificada pelo caminho real normalizado. Chamadas aninhadas na mesma thread reutilizam o bloqueio, sem deadlock; outra thread ou processo precisa obter seu próprio bloqueio. Sistemas sem esses backends falham explicitamente, em vez de seguir sem proteção.
+
+O arquivo `.monitor.lock` **não deve ser apagado**, mesmo após encerrar o monitor. A proteção é do sistema operacional, não da existência do arquivo nem de um PID gravado. O bloqueio é liberado ao sair normalmente, após exceção/Ctrl+C ou quando o processo termina abruptamente. Um arquivo de lock remanescente é normal e não precisa de limpeza. Apagá-lo enquanto houver um processo ativo pode permitir que uma nova execução abra outro arquivo e contorne a proteção.
+
+Ao importar o módulo, `run_poll`, `poll_once`, `read_events`, `build_report`, `write_report` e `pending_alerts` também usam o bloqueio e levantam `DataDirectoryBusy` em conflito. Funções de baixo nível como `append_event`, `save_state`, `load_state` e `archive_event_file` pressupõem que o chamador mantém `with data_directory_lock(cfg):` enquanto opera. Usar essas funções sem esse contexto, editar arquivos manualmente ou executar versões antigas que não participam do protocolo **não** está protegido.
+
+O escopo é **disco local e processos cooperantes**. Não é um bloqueio distribuído, não foi validado para NFS/SMB/pastas sincronizadas e não impede ferramentas externas de alterar arquivos. Pare o monitor antes de backups ou manipulação externa. O CI verifica exclusão e liberação com processos reais separados no Linux; o caminho específico de `msvcrt` é simulado em testes, sem alegação de validação real no Windows. Recuperação de estado/CSV após interrupção continua sendo uma etapa separada.
 
 <details>
 <summary>Colunas do <code>eventos.csv</code></summary>
@@ -313,7 +326,7 @@ Dispositivos com MAC aleatório (bit "localmente administrado" ligado) e nome co
 - Registrar os eventos de roaming (troca de AP sem queda) para separar roaming lento de perda real de sinal.
 - Ler também métricas da AP no momento da queda (TX Retry, Channel Utilization) para correlacionar com interferência.
 - Exportar para Prometheus ou Zabbix e acompanhar a tendência em um painel.
-- Rodar como serviço (systemd no Linux, Agendador de Tarefas no Windows), com controle de execução única e recuperação de falhas de arquivo; a rotação por tamanho já está implementada.
+- Rodar como serviço (systemd no Linux, Agendador de Tarefas no Windows), com recuperação de falhas de arquivo; rotação por tamanho e bloqueio de execução única já estão implementados.
 - Adaptador para outras controladoras.
 
 ## Segurança
