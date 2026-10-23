@@ -105,6 +105,7 @@ setx UNIFI_API_KEY "sua-chave"
 | `collector_macs` | Inventário opcional: `"mac": "Modelo"` |
 | `ap_names` | Opcional: `"mac_da_ap": "Nome"`, já que a API legada não envia o nome da AP |
 | `state_dir` | Opcional: pasta dos dados (padrão: `dados/` ao lado do script) |
+| `csv_max_bytes` | Limite do CSV ativo em bytes, inteiro não negativo; padrão 10485760, ou 10 MiB. `0` desativa a rotação por tamanho. Um evento individual maior que o limite é preservado inteiro. |
 
 Para usar outro arquivo de configuração, defina a variável `COLETORES_CONFIG` com o caminho dele.
 
@@ -186,7 +187,7 @@ Não há retentativa dentro da mesma coleta para HTTP 401/403/429, outros códig
 
 HTTP 429 e `Retry-After` encerram o ciclo sem novas requisições imediatas; o modo `loop` ainda usa `poll_seconds` para o ciclo seguinte e **não implementa um agendador que respeite automaticamente um prazo maior indicado pelo servidor**. Se isso ocorrer, interrompa o loop e ajuste a frequência segundo a política da API antes de continuar. Essa política conservadora não é um limitador global de requisições.
 
-Durante as tentativas, os arquivos de estado e eventos permanecem inalterados. Se uma tentativa recuperar uma amostra válida, ela é processada uma vez; se todas falharem, o erro final é propagado e o estado anterior é preservado. As pausas e o tempo das requisições aumentam o intervalo entre amostras. Esta etapa não adiciona rotação de CSV, concorrência ou registro separado de lacunas.
+Durante as tentativas, os arquivos de estado e eventos permanecem inalterados. Se uma tentativa recuperar uma amostra válida, ela é processada uma vez; se todas falharem, o erro final é propagado e o estado anterior é preservado. As pausas e o tempo das requisições aumentam o intervalo entre amostras. Concorrência e registro separado de lacunas ainda não são implementados.
 
 ## Exemplo de uso
 
@@ -244,9 +245,23 @@ Cenário fictício: um Urovo na antena "Expedição - 1" com sinal fraco (-71 dB
 | Arquivo | Descrição |
 |---|---|
 | `dados/estado.json` | Estado atual dos coletores (interno) |
-| `dados/eventos.csv` | Log de todos os eventos (queda, reconexão) com timestamp, AP, sinal e banda |
+| `dados/eventos.csv` | CSV ativo de eventos com timestamp, AP, sinal e banda |
+| `dados/eventos_arquivo_<data>_<id>.csv` | Arquivos rotacionados no formato atual, incluídos na leitura de eventos, relatórios e alertas |
+| `dados/eventos_legado_<data>_<id>.csv` | Formatos antigos preservados separadamente; não são convertidos nem incluídos automaticamente nos relatórios |
 | `dados/alertas_emitidos.json` | Alertas já mostrados no dia, para o modo `loop` não repetir o mesmo alerta |
 | `dados/relatorio_AAAA-MM-DD.md` | Relatório diário com top coletores afetados, quedas por hora e alertas |
+
+### Rotação do CSV sem exclusão de histórico
+
+Antes de gravar um evento, o monitor calcula o tamanho da linha serializada em UTF-8. Se acrescentá-la ultrapassaria `csv_max_bytes` e o CSV ativo já possui eventos, ele move o arquivo inteiro para `eventos_arquivo_<data>_<id>.csv` na mesma pasta e inicia um novo `eventos.csv` com cabeçalho. O nome combina data/hora e identificador exclusivo, sem substituir nomes já existentes em execução única. A rotação preserva os bytes do arquivo anterior; não recorta linhas nem exclui arquivos por idade ou quantidade.
+
+O limite é um alvo por arquivo, não um teto rígido: o primeiro evento de um arquivo é gravado inteiro, mesmo se cabeçalho e linha ultrapassarem o limite. Isso evita perder um evento grande ou criar arquivos rotacionados só com cabeçalho. Um CSV antigo já acima do limite é rotacionado na próxima gravação de evento. Arquivo vazio recebe um cabeçalho normal; `csv_max_bytes: 0` mantém a gravação sem rotação por tamanho.
+
+`read_events`, os relatórios e os alertas leem os arquivos `eventos_arquivo_*.csv` e o CSV ativo, ordenando os eventos por timestamp. Funcionam também quando há somente arquivos rotacionados. CSVs legados e outros arquivos não são incluídos. Cabeçalho incompatível ou linha com colunas ausentes/extras em um arquivo atual gera erro visível, em vez de um relatório silenciosamente incompleto. Não copie o mesmo arquivo de histórico mais de uma vez com nomes que correspondam a esse padrão: o monitor não deduplica cópias inseridas manualmente.
+
+Essa rotação limita o tamanho do **arquivo ativo**, mas não o uso total de disco nem o consumo de memória: os relatórios ainda carregam todo o histórico atual. Planeje backup e arquivamento externo conforme a necessidade; remover arquivos da pasta de dados reduz o período disponível nos relatórios. Com o monitor parado, copie `eventos.csv`, os arquivos rotacionados, `estado.json` e `alertas_emitidos.json` para preservar o conjunto consistente. Os testes desta etapa usam dados fictícios e não equivalem a validação de backup/restauração em produção.
+
+Use **um único processo escritor por `state_dir`** e pare-o antes de manipular ou gerar relatórios durante uma rotação. Não há bloqueio entre processos nem transação conjunta entre CSV e estado. Falhas de disco, interrupção entre gravações ou execução concorrente precisam de recuperação operacional; esta etapa não promete ausência de perda/duplicação nesses cenários. Os testes verificam rotação normal, UTF-8, nomes exclusivos, preservação de bytes, histórico sem duplicação e relatórios/alertas equivalentes antes e depois da rotação.
 
 <details>
 <summary>Colunas do <code>eventos.csv</code></summary>
@@ -265,7 +280,7 @@ Cenário fictício: um Urovo na antena "Expedição - 1" com sinal fraco (-71 dB
 | `banda` | Rádio usado (`ng` = 2,4 GHz, `na` = 5 GHz) |
 | `duracao_s` | Duração da queda em segundos (vazio na linha de queda; preenchido na reconexão) |
 
-Se o `eventos.csv` existente estiver no formato antigo, ele é renomeado para `eventos_legado_<data>.csv` e um novo arquivo é iniciado.
+Se o `eventos.csv` existente estiver no formato antigo, ele é movido para `eventos_legado_<data>_<id>.csv` e um novo arquivo é iniciado. O conteúdo antigo é preservado sem conversão e não entra automaticamente nos relatórios do formato atual. Arquivos legados de versões anteriores também permanecem fora da leitura atual.
 
 </details>
 
@@ -298,7 +313,7 @@ Dispositivos com MAC aleatório (bit "localmente administrado" ligado) e nome co
 - Registrar os eventos de roaming (troca de AP sem queda) para separar roaming lento de perda real de sinal.
 - Ler também métricas da AP no momento da queda (TX Retry, Channel Utilization) para correlacionar com interferência.
 - Exportar para Prometheus ou Zabbix e acompanhar a tendência em um painel.
-- Rodar como serviço (systemd no Linux, Agendador de Tarefas no Windows) com rotação do CSV.
+- Rodar como serviço (systemd no Linux, Agendador de Tarefas no Windows), com controle de execução única e recuperação de falhas de arquivo; a rotação por tamanho já está implementada.
 - Adaptador para outras controladoras.
 
 ## Segurança

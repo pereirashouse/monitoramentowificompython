@@ -14,6 +14,8 @@ A chave da API é lida da variável de ambiente UNIFI_API_KEY (nunca do arquivo)
 
 import csv
 import datetime as dt
+import glob
+import io
 import json
 import os
 import random
@@ -23,10 +25,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 import warnings
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = os.path.join(HERE, "config.json")
+DEFAULT_CSV_MAX_BYTES = 10 * 1024 * 1024
 
 # Prefixos de fabricante usados para classificar os coletores
 PREFIX_URUVO = ("b4:29:3d",)
@@ -45,6 +49,8 @@ def load_config(path=DEFAULT_CONFIG):
     cfg.setdefault("retry_backoff_seconds", 2)
     cfg.setdefault("retry_max_delay_seconds", 30)
     validate_retry_options(cfg)
+    cfg.setdefault("csv_max_bytes", DEFAULT_CSV_MAX_BYTES)
+    validate_csv_max_bytes(cfg["csv_max_bytes"])
     cfg.setdefault("state_dir", os.path.join(HERE, "dados"))
     cfg["collector_macs"] = {m.lower(): n for m, n in cfg.get("collector_macs", {}).items()}
     # Opcional: nome amigável das APs, pelo MAC (a API não envia o nome da AP).
@@ -268,20 +274,53 @@ EVENT_FIELDS = ["timestamp", "mac", "tipo", "origem_id", "nome", "evento",
                 "ap", "rssi_dbm", "snr", "banda", "duracao_s"]
 
 
-def append_event(path, row):
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            header = next(csv.reader(f), [])
+def validate_csv_max_bytes(value):
+    """Um inteiro não negativo; zero desativa apenas a rotação por tamanho."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("csv_max_bytes deve ser um inteiro não negativo; 0 desativa a rotação.")
+    return value
+
+
+def archive_event_file(path, label):
+    """Move o arquivo inteiro para um nome exclusivo, em execução única."""
+    stem, _ = os.path.splitext(path)
+    stamp = dt.datetime.now().strftime("%Y%m%d%H%M%S%f")
+    while True:
+        destination = f"{stem}_{label}_{stamp}_{uuid.uuid4().hex}.csv"
+        if not os.path.lexists(destination):
+            break
+    os.rename(path, destination)
+    return destination
+
+
+def append_event(path, row, max_bytes=DEFAULT_CSV_MAX_BYTES):
+    max_bytes = validate_csv_max_bytes(max_bytes)
+    path = os.fspath(path)
+    # Serializa antes de mover arquivos: um evento inválido não inicia rotação.
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=EVENT_FIELDS)
+    writer.writeheader()
+    header_text = buffer.getvalue()
+    buffer.seek(0)
+    buffer.truncate(0)
+    writer.writerow(row)
+    row_text = buffer.getvalue()
+    new = not os.path.exists(path) or os.path.getsize(path) == 0
+    if not new:
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, [])
+            has_events = next(reader, None) is not None
         if header != EVENT_FIELDS:
-            # formato antigo (coluna rssi_ultimo): preserva o arquivo e começa um novo
-            stamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
-            os.replace(path, path[:-4] + "_legado_" + stamp + ".csv")
-    new = not os.path.exists(path)
+            archive_event_file(path, "legado")
+            new = True
+        elif max_bytes and has_events and os.path.getsize(path) + len(row_text.encode("utf-8")) > max_bytes:
+            archive_event_file(path, "arquivo")
+            new = True
     with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=EVENT_FIELDS)
         if new:
-            w.writeheader()
-        w.writerow(row)
+            f.write(header_text)
+        f.write(row_text)
 
 
 def poll_once(cfg, clients_now, now=None):
@@ -290,6 +329,7 @@ def poll_once(cfg, clients_now, now=None):
     clients_now: lista já normalizada (normalize()).
     Retorna lista de eventos gerados.
     """
+    max_bytes = validate_csv_max_bytes(cfg.get("csv_max_bytes", DEFAULT_CSV_MAX_BYTES))
     now = now or dt.datetime.now().replace(microsecond=0)
     state_file, events_file = state_paths(cfg)
     state = load_state(state_file)
@@ -339,7 +379,7 @@ def poll_once(cfg, clients_now, now=None):
         }
 
     for ev in events:
-        append_event(events_file, ev)
+        append_event(events_file, ev, max_bytes=max_bytes)
     save_state(state_file, state)
     return events
 
@@ -348,10 +388,21 @@ def poll_once(cfg, clients_now, now=None):
 
 def read_events(cfg):
     _, events_file = state_paths(cfg)
-    if not os.path.exists(events_file):
-        return []
-    with open(events_file, encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+    archives = sorted(glob.glob(os.path.join(glob.escape(cfg["state_dir"]), "eventos_arquivo_*.csv")))
+    paths = archives + ([events_file] if os.path.exists(events_file) else [])
+    events = []
+    for path in paths:
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None and path == events_file:
+                continue
+            if reader.fieldnames != EVENT_FIELDS:
+                raise ValueError(f"Cabeçalho CSV incompatível: {os.path.basename(path)}.")
+            for row in reader:
+                if None in row or any(value is None for value in row.values()):
+                    raise ValueError(f"Linha CSV incompleta ou com colunas extras: {os.path.basename(path)}.")
+                events.append(row)
+    return sorted(events, key=lambda event: event["timestamp"])
 
 
 def drops_per_hour(events, day):

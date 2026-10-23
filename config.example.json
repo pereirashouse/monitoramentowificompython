@@ -10,6 +10,7 @@
   "retry_backoff_seconds": 2,
   "retry_max_delay_seconds": 30,
   "alert_drops_per_hour": 3,
+  "csv_max_bytes": 10485760,
   "collector_macs": {
     "b4:29:3d:aa:bb:01": "Urovo DT40",
     "04:7b:cb:aa:bb:02": "Skorpio X5",
