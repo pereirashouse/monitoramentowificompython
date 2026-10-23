@@ -21,6 +21,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import warnings
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = os.path.join(HERE, "config.json")
@@ -37,6 +38,7 @@ def load_config(path=DEFAULT_CONFIG):
     cfg.setdefault("poll_seconds", 60)
     cfg.setdefault("alert_drops_per_hour", 3)
     cfg.setdefault("verify_tls", True)
+    validate_tls_options(cfg)
     cfg.setdefault("state_dir", os.path.join(HERE, "dados"))
     cfg["collector_macs"] = {m.lower(): n for m, n in cfg.get("collector_macs", {}).items()}
     # Opcional: nome amigável das APs, pelo MAC (a API não envia o nome da AP).
@@ -72,6 +74,36 @@ CONFIG_COLLECTORS = {}
 
 # ---------------------------------------------------------------- UniFi (leitura)
 
+def validate_tls_options(cfg):
+    """Rejeita opções ambíguas antes de aplicar a política TLS."""
+    verify_tls = cfg.get("verify_tls", True)
+    if not isinstance(verify_tls, bool):
+        raise ValueError("verify_tls deve ser um booleano JSON: true ou false.")
+    ca_file = cfg.get("ca_file")
+    if ca_file is not None and not isinstance(ca_file, str):
+        raise ValueError("ca_file deve ser null ou um caminho PEM em texto.")
+    return verify_tls, ca_file or None
+
+
+def create_tls_context(cfg):
+    """Valida certificado e hostname por padrão, sem fallback inseguro."""
+    verify_tls, ca_file = validate_tls_options(cfg)
+    if verify_tls:
+        return ssl.create_default_context(cafile=ca_file)
+
+    warnings.warn(
+        "TLS sem validação de certificado e hostname (verify_tls=false). "
+        "Risco de interceptação da chave de API e dos dados; use somente "
+        "temporariamente em laboratório isolado, nunca em produção.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def unifi_get_clients(cfg):
     """Lista os clientes Wi-Fi do SSID configurado.
 
@@ -79,9 +111,7 @@ def unifi_get_clients(cfg):
     Confirmar contra a controladora real antes de produção (ver runbook IT-INFRA-017).
     """
     url = f"https://{cfg['controller_host']}{cfg['clients_path']}"
-    ctx = ssl.create_default_context(cafile=cfg.get("ca_file") or None)
-    if not cfg["verify_tls"]:
-        ctx = ssl._create_unverified_context()
+    ctx = create_tls_context(cfg)
     key = os.environ.get("UNIFI_API_KEY")
     if not key:
         raise RuntimeError("Defina a variável de ambiente UNIFI_API_KEY.")
