@@ -218,14 +218,14 @@ class CollectionStateTests(unittest.TestCase):
                         m.run_poll(self.cfg)
                 self.assertEqual(self.snapshot(), self.before)
 
-    def test_primeira_coleta_com_erro_nao_cria_pasta_de_dados(self):
+    def test_primeira_coleta_com_erro_cria_so_metadado_de_bloqueio(self):
         cfg = copy.deepcopy(self.cfg)
         folder = self.folder / "ainda-nao-existe"
         cfg["state_dir"] = str(folder)
         with patch.object(m.urllib.request, "urlopen", return_value=response({"data": None})):
             with self.assertRaises(m.UnifiResponseError):
                 m.run_poll(cfg)
-        self.assertFalse(folder.exists())
+        self.assertEqual([p.name for p in folder.iterdir()], [".monitor.lock"])
 
     def test_lista_vazia_valida_ainda_registra_queda_real_observada(self):
         with patch.object(m.urllib.request, "urlopen", return_value=response({"meta": {"rc": "ok"}, "data": []})):

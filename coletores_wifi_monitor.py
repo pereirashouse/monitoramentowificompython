@@ -14,6 +14,9 @@ A chave da API é lida da variável de ambiente UNIFI_API_KEY (nunca do arquivo)
 
 import csv
 import datetime as dt
+import errno
+from contextlib import contextmanager
+from functools import wraps
 import glob
 import io
 import json
@@ -22,6 +25,7 @@ import random
 import socket
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -248,6 +252,78 @@ def normalize(raw, ap_names=None):
 
 # ---------------------------------------------------------------- estado e eventos
 
+class DataDirectoryBusy(RuntimeError):
+    """Outra operação cooperante já usa a pasta de dados."""
+
+
+_DATA_LOCKS = threading.local()
+
+
+def _acquire_file_lock(file):
+    if os.name == "posix":
+        import fcntl
+        fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    elif os.name == "nt":
+        import msvcrt
+        file.seek(0, os.SEEK_END)
+        if file.tell() == 0:
+            file.write(b"\0")
+            file.flush()
+        file.seek(0)
+        msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        raise RuntimeError("Bloqueio de dados disponível somente em POSIX ou Windows.")
+
+
+def _release_file_lock(file):
+    if os.name == "posix":
+        import fcntl
+        fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+    elif os.name == "nt":
+        import msvcrt
+        file.seek(0)
+        msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+@contextmanager
+def data_directory_lock(cfg):
+    """Bloqueio não bloqueante e reentrante na mesma thread, em disco local."""
+    folder = os.path.normcase(os.path.realpath(os.path.abspath(cfg["state_dir"])))
+    if getattr(_DATA_LOCKS, "pid", None) != os.getpid():
+        _DATA_LOCKS.pid = os.getpid()
+        _DATA_LOCKS.held = set()
+    held = _DATA_LOCKS.held
+    if folder in held:
+        yield
+        return
+    os.makedirs(folder, exist_ok=True)
+    # Não remover o arquivo: outro processo pode estar usando o mesmo inode.
+    with open(os.path.join(folder, ".monitor.lock"), "a+b") as file:
+        try:
+            _acquire_file_lock(file)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise DataDirectoryBusy(
+                    "Pasta de dados ocupada por outra execução. "
+                    "Encerre a execução atual antes de iniciar outra; não apague .monitor.lock."
+                ) from exc
+            raise
+        held.add(folder)
+        try:
+            yield
+        finally:
+            held.remove(folder)
+            _release_file_lock(file)
+
+
+def locked_data_operation(function):
+    @wraps(function)
+    def locked(cfg, *args, **kwargs):
+        with data_directory_lock(cfg):
+            return function(cfg, *args, **kwargs)
+    return locked
+
+
 def state_paths(cfg):
     os.makedirs(cfg["state_dir"], exist_ok=True)
     return (
@@ -324,6 +400,13 @@ def append_event(path, row, max_bytes=DEFAULT_CSV_MAX_BYTES):
 
 
 def poll_once(cfg, clients_now, now=None):
+    """Processa uma amostra sob bloqueio exclusivo da pasta de dados."""
+    validate_csv_max_bytes(cfg.get("csv_max_bytes", DEFAULT_CSV_MAX_BYTES))
+    with data_directory_lock(cfg):
+        return _poll_once_locked(cfg, clients_now, now)
+
+
+def _poll_once_locked(cfg, clients_now, now=None):
     """Compara a lista atual com o estado anterior e registra transições.
 
     clients_now: lista já normalizada (normalize()).
@@ -386,6 +469,7 @@ def poll_once(cfg, clients_now, now=None):
 
 # ---------------------------------------------------------------- relatório e alerta
 
+@locked_data_operation
 def read_events(cfg):
     _, events_file = state_paths(cfg)
     archives = sorted(glob.glob(os.path.join(glob.escape(cfg["state_dir"]), "eventos_arquivo_*.csv")))
@@ -423,6 +507,7 @@ def alerts_for(cfg, events, day):
             if n > limite]
 
 
+@locked_data_operation
 def build_report(cfg, day):
     events = read_events(cfg)
     dia = [e for e in events if e["timestamp"].startswith(day)]
@@ -455,6 +540,7 @@ def build_report(cfg, day):
     return "\n".join(linhas) + "\n"
 
 
+@locked_data_operation
 def write_report(cfg, day):
     text = build_report(cfg, day)
     path = os.path.join(cfg["state_dir"], f"relatorio_{day}.md")
@@ -470,6 +556,7 @@ def alert_registry_path(cfg):
     return os.path.join(cfg["state_dir"], "alertas_emitidos.json")
 
 
+@locked_data_operation
 def pending_alerts(cfg, alertas, day):
     """Devolve só os alertas (MAC, hora) ainda não emitidos no dia.
 
@@ -487,6 +574,7 @@ def pending_alerts(cfg, alertas, day):
     return novos
 
 
+@locked_data_operation
 def run_poll(cfg):
     raw = unifi_get_clients(cfg)
     # Só uma amostra validada pode chegar à gravação de estado e eventos.
@@ -502,7 +590,18 @@ def main(argv):
     cfg = load_config(os.environ.get("COLETORES_CONFIG", DEFAULT_CONFIG))
     CONFIG_COLLECTORS = cfg["collector_macs"]
     cmd = argv[1] if len(argv) > 1 else "poll"
+    if cmd not in ("poll", "loop", "report"):
+        print(__doc__)
+        return 2
+    try:
+        with data_directory_lock(cfg):
+            return _execute_command(cfg, cmd, argv)
+    except DataDirectoryBusy as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
 
+
+def _execute_command(cfg, cmd, argv):
     if cmd == "poll":
         events, alertas = run_poll(cfg)
         print(f"{len(events)} evento(s) registrado(s).")

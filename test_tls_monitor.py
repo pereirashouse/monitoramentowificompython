@@ -111,11 +111,14 @@ class TlsContextTests(unittest.TestCase):
 
 class UnifiTlsTests(unittest.TestCase):
     def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
         self.cfg = {
             "controller_host": "unifi.example.invalid",
             "clients_path": "/proxy/network/api/s/testsite/stat/sta",
             "ssid": "wms",
             "verify_tls": True,
+            "state_dir": folder.name,
         }
         env = patch.dict(os.environ, {"UNIFI_API_KEY": "chave-ficticia-de-teste"})
         env.start()
