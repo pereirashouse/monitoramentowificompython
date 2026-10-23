@@ -6,6 +6,9 @@
   "verify_tls": true,
   "ca_file": null,
   "poll_seconds": 60,
+  "retry_max_attempts": 3,
+  "retry_backoff_seconds": 2,
+  "retry_max_delay_seconds": 30,
   "alert_drops_per_hour": 3,
   "collector_macs": {
     "b4:29:3d:aa:bb:01": "Urovo DT40",
