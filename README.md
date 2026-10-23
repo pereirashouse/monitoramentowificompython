@@ -157,6 +157,9 @@ python coletores_wifi_monitor.py report
 
 # Relatório de uma data específica
 python coletores_wifi_monitor.py report 2026-10-15
+
+# Recuperação explícita do estado, após backup e inspeção dos arquivos
+python coletores_wifi_monitor.py recover-state
 ```
 
 ### 4. Testar
@@ -245,6 +248,8 @@ Cenário fictício: um Urovo na antena "Expedição - 1" com sinal fraco (-71 dB
 | Arquivo | Descrição |
 |---|---|
 | `dados/estado.json` | Estado atual dos coletores (interno) |
+| `dados/estado.json.bak` | Estado válido anterior; criado a partir da segunda gravação, para recuperação explícita |
+| `dados/estado.json.corrompido_<id>` | Cópia byte a byte do estado inválido preservado durante uma recuperação |
 | `dados/eventos.csv` | CSV ativo de eventos com timestamp, AP, sinal e banda |
 | `dados/eventos_arquivo_<data>_<id>.csv` | Arquivos rotacionados no formato atual, incluídos na leitura de eventos, relatórios e alertas |
 | `dados/eventos_legado_<data>_<id>.csv` | Formatos antigos preservados separadamente; não são convertidos nem incluídos automaticamente nos relatórios |
@@ -274,7 +279,25 @@ O arquivo `.monitor.lock` **não deve ser apagado**, mesmo após encerrar o moni
 
 Ao importar o módulo, `run_poll`, `poll_once`, `read_events`, `build_report`, `write_report` e `pending_alerts` também usam o bloqueio e levantam `DataDirectoryBusy` em conflito. Funções de baixo nível como `append_event`, `save_state`, `load_state` e `archive_event_file` pressupõem que o chamador mantém `with data_directory_lock(cfg):` enquanto opera. Usar essas funções sem esse contexto, editar arquivos manualmente ou executar versões antigas que não participam do protocolo **não** está protegido.
 
-O escopo é **disco local e processos cooperantes**. Não é um bloqueio distribuído, não foi validado para NFS/SMB/pastas sincronizadas e não impede ferramentas externas de alterar arquivos. Pare o monitor antes de backups ou manipulação externa. O CI verifica exclusão e liberação com processos reais separados no Linux; o caminho específico de `msvcrt` é simulado em testes, sem alegação de validação real no Windows. Recuperação de estado/CSV após interrupção continua sendo uma etapa separada.
+O escopo é **disco local e processos cooperantes**. Não é um bloqueio distribuído, não foi validado para NFS/SMB/pastas sincronizadas e não impede ferramentas externas de alterar arquivos. Pare o monitor antes de backups ou manipulação externa. O CI verifica exclusão e liberação com processos reais separados no Linux; o caminho específico de `msvcrt` é simulado em testes, sem alegação de validação real no Windows. `recover-state` também usa o bloqueio; a restauração explícita de estado descrita abaixo não recupera automaticamente o CSV.
+
+### Persistência segura e recuperação explícita do estado
+
+`estado.json`, `alertas_emitidos.json` e os relatórios Markdown são gravados em um temporário exclusivo na mesma pasta. O conteúdo é escrito, descarregado com `flush`/`fsync`, fechado e então substituído com `os.replace`. Falhas antes da substituição não truncam o destino anterior; temporários dessa operação são removidos quando possível. Um `estado.json.tmp` deixado por versões antigas não é promovido nem reutilizado automaticamente.
+
+A partir da segunda gravação de estado, `estado.json.bak` guarda o **estado válido anterior**, antes de substituir o atual. O estado atual precisa ser legível e válido para atualizar essa cópia; conteúdo corrompido não sobrescreve um backup válido. Se a gravação do backup falhar, o estado atual não é substituído. Não existe ainda backup na primeira gravação, e essa cópia de uma versão não substitui uma política de backup externo.
+
+Antes de consultar a API, `run_poll` valida estado e registro de alertas. JSON/UTF-8 malformado, estrutura incompatível ou estado com valores não serializáveis/não finitos interrompem a operação. O estado deve ser um objeto por MAC, com `online` booleano; campos textuais permanecem textuais, timestamps usam ISO sem fuso, cliente offline precisa de `queda_em` e cliente online não pode manter uma queda pendente. Campos extras serializáveis são preservados. O registro de alertas precisa ser uma lista de identificadores textuais não vazios.
+
+Estado ausente só é tratado como início a frio quando não há backup nem histórico reconhecido do formato atual. Com `estado.json.bak`, arquivos rotacionados ou eventos atuais já gravados, a ausência do estado exige recuperação explícita. Formatos legados não são convertidos em estado. O monitor não troca silenciosamente corrupção por `{}` nem restaura uma cópia antiga durante a coleta.
+
+Erro de persistência termina `poll`/`report`/`recover-state` com **status 4**; no `loop`, ele também encerra a execução com status 4, em vez de repetir um ciclo que pode ter sido parcialmente gravado. Falhas transitórias de rede continuam seguindo a política de retentativas e o intervalo do loop. O arquivo de lock permanece, mas o bloqueio é liberado ao encerrar.
+
+**Procedimento de recuperação:** pare o monitor, copie a pasta de dados para um local seguro e inspecione os arquivos e horários. Se o estado estiver ausente ou inválido e houver `estado.json.bak` válido, execute `python coletores_wifi_monitor.py recover-state`. O comando mantém o bloqueio, valida o backup, preserva os bytes do estado inválido em `estado.json.corrompido_<id>` quando ele existe e restaura somente `estado.json`. Não consulta a API, não altera o CSV nem o registro de alertas e recusa retroceder um estado atual que ainda seja válido. Backup ausente ou inválido interrompe a recuperação sem apagar os arquivos existentes.
+
+**Não reinicie a coleta imediatamente após restaurar:** o backup é anterior ao estado atual e pode estar defasado em relação aos eventos já gravados. Reconcilie CSV, estado e lacunas de observação com o conjunto de backup/linha de base do ambiente; caso contrário, transições podem ser repetidas. O comando não reconstrói estado a partir do CSV e não desfaz eventos. Registro de alertas corrompido também exige inspeção/restauração manual de uma cópia confiável, não reinício silencioso.
+
+A gravação é atômica **por arquivo**, não uma transação entre CSV, estado, backup e alertas. O CSV continua sendo acrescentado e rotacionado, sem rollback transacional. Se ele receber uma queda e a gravação de estado falhar depois, o CSV pode ficar à frente do estado; os testes exercitam exatamente esse cenário e a execução é interrompida. Uma nova partida manual sem reconciliação pode duplicar eventos. `fsync` do arquivo e substituição local reduzem o risco, mas não garantem durabilidade contra queda de energia, falha do dispositivo ou semânticas de todo sistema de arquivos; esta etapa não sincroniza os diretórios nem implementa journal. São testes de falha simulada em laboratório, não validação de restauração em produção.
 
 <details>
 <summary>Colunas do <code>eventos.csv</code></summary>
@@ -326,7 +349,7 @@ Dispositivos com MAC aleatório (bit "localmente administrado" ligado) e nome co
 - Registrar os eventos de roaming (troca de AP sem queda) para separar roaming lento de perda real de sinal.
 - Ler também métricas da AP no momento da queda (TX Retry, Channel Utilization) para correlacionar com interferência.
 - Exportar para Prometheus ou Zabbix e acompanhar a tendência em um painel.
-- Rodar como serviço (systemd no Linux, Agendador de Tarefas no Windows), com recuperação de falhas de arquivo; rotação por tamanho e bloqueio de execução única já estão implementados.
+- Rodar como serviço (systemd no Linux, Agendador de Tarefas no Windows), documentando backup/restauração e reconciliação após falhas; rotação, execução única e recuperação explícita do estado já estão implementadas.
 - Adaptador para outras controladoras.
 
 ## Segurança

@@ -7,6 +7,7 @@ Uso:
   python coletores_wifi_monitor.py poll     -> coleta uma vez e registra eventos
   python coletores_wifi_monitor.py report   -> gera o relatório do dia (Markdown)
   python coletores_wifi_monitor.py loop     -> poll a cada N segundos (config)
+  python coletores_wifi_monitor.py recover-state -> restaura backup válido explicitamente
 
 Configuração: arquivo config.json ao lado do script (ver config.example.json).
 A chave da API é lida da variável de ambiente UNIFI_API_KEY (nunca do arquivo).
@@ -25,6 +26,7 @@ import random
 import socket
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -332,18 +334,136 @@ def state_paths(cfg):
     )
 
 
+class PersistenceError(RuntimeError):
+    """Persistência inválida ou gravação malsucedida; não reiniciar do zero."""
+
+
+def atomic_write_bytes(path, content):
+    """Grava em temporário exclusivo na mesma pasta, fsync e replace."""
+    path = os.fspath(path)
+    temporary = None
+    try:
+        fd, temporary = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".tmp",
+                                         dir=os.path.dirname(os.path.abspath(path)))
+        with os.fdopen(fd, "wb") as file:
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    except OSError as exc:
+        raise PersistenceError(f"Falha ao gravar {os.path.basename(path)}; interrompa e verifique os arquivos.") from exc
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def atomic_write_text(path, content):
+    atomic_write_bytes(path, content.encode("utf-8"))
+
+
+def json_text(data):
+    try:
+        return json.dumps(data, ensure_ascii=False, indent=1, allow_nan=False) + "\n"
+    except (TypeError, ValueError) as exc:
+        raise PersistenceError("Conteúdo de persistência não serializável ou não finito.") from exc
+
+
+def read_persistent_json(path):
+    try:
+        with open(path, encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise PersistenceError(f"Arquivo inválido ou ilegível: {os.path.basename(path)}. Não reinicie do zero.") from exc
+
+
+def validate_state(state):
+    if not isinstance(state, dict):
+        raise PersistenceError("Estado inválido: esperado um objeto de clientes.")
+    for mac, info in state.items():
+        if not isinstance(mac, str) or not mac.strip() or not isinstance(info, dict):
+            raise PersistenceError("Estado inválido: chave ou registro de cliente incompatível.")
+        if not isinstance(info.get("online"), bool):
+            raise PersistenceError("Estado inválido: online deve ser booleano.")
+        for field in ("name", "ap", "band"):
+            if field in info and not isinstance(info[field], str):
+                raise PersistenceError(f"Estado inválido: {field} deve ser textual.")
+        for field in ("last_seen", "queda_em"):
+            value = info.get(field)
+            if value is not None:
+                try:
+                    if not isinstance(value, str) or dt.datetime.fromisoformat(value).tzinfo is not None:
+                        raise ValueError
+                except ValueError as exc:
+                    raise PersistenceError(f"Estado inválido: {field} deve ser timestamp ISO sem fuso.") from exc
+        if info["online"] and info.get("queda_em") is not None:
+            raise PersistenceError("Estado inválido: cliente online com queda pendente.")
+        if not info["online"] and info.get("queda_em") is None:
+            raise PersistenceError("Estado inválido: cliente offline sem timestamp de queda.")
+    return state
+
+
+def read_state_file(path):
+    state = validate_state(read_persistent_json(path))
+    json_text(state)
+    return state
+
+
 def load_state(path):
+    path = os.fspath(path)
     if not os.path.exists(path):
+        folder = os.path.dirname(os.path.abspath(path))
+        archives = glob.glob(os.path.join(glob.escape(folder), "eventos_arquivo_*.csv"))
+        history = False
+        active = os.path.join(folder, "eventos.csv")
+        if os.path.exists(active):
+            try:
+                with open(active, newline="", encoding="utf-8") as file:
+                    reader = csv.reader(file)
+                    history = next(reader, []) == EVENT_FIELDS and next(reader, None) is not None
+            except (OSError, UnicodeError, csv.Error) as exc:
+                raise PersistenceError("Estado ausente e CSV ilegível; interrompa e reconcilie os arquivos.") from exc
+        if os.path.exists(path + ".bak") or archives or history:
+            raise PersistenceError("Estado ausente com backup ou histórico; recuperação explícita necessária.")
         return {}
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    return read_state_file(path)
 
 
 def save_state(path, state):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
+    path = os.fspath(path)
+    content = json_text(validate_state(state))
+    if os.path.exists(path):
+        previous = read_state_file(path)
+        atomic_write_text(path + ".bak", json_text(previous))
+    elif os.path.exists(path + ".bak"):
+        raise PersistenceError("Estado ausente com backup; use recuperação explícita antes de gravar.")
+    atomic_write_text(path, content)
+
+
+@locked_data_operation
+def recover_state(cfg):
+    """Restaura somente backup válido e preserva o estado corrompido."""
+    state_file, _ = state_paths(cfg)
+    backup_file = state_file + ".bak"
+    if not os.path.exists(backup_file):
+        raise PersistenceError("Backup de estado ausente; restauração automática não é possível.")
+    backup = read_state_file(backup_file)
+    preserved = None
+    if os.path.exists(state_file):
+        try:
+            read_state_file(state_file)
+        except PersistenceError:
+            with open(state_file, "rb") as file:
+                original = file.read()
+            preserved = state_file + ".corrompido_" + uuid.uuid4().hex
+            atomic_write_bytes(preserved, original)
+        else:
+            raise PersistenceError("Estado atual válido; recuperação recusada para evitar retrocesso.")
+    atomic_write_text(state_file, json_text(backup))
+    return preserved
 
 
 EVENT_FIELDS = ["timestamp", "mac", "tipo", "origem_id", "nome", "evento",
@@ -461,9 +581,14 @@ def _poll_once_locked(cfg, clients_now, now=None):
             "queda_em": None,  # limpa a marca de queda após a reconexão
         }
 
-    for ev in events:
-        append_event(events_file, ev, max_bytes=max_bytes)
-    save_state(state_file, state)
+    validate_state(state)
+    json_text(state)  # serialização precisa ser possível antes de acrescentar eventos
+    try:
+        for ev in events:
+            append_event(events_file, ev, max_bytes=max_bytes)
+        save_state(state_file, state)
+    except OSError as exc:
+        raise PersistenceError("Falha ao persistir a coleta; reconcilie CSV e estado antes de retomar.") from exc
     return events
 
 
@@ -544,8 +669,7 @@ def build_report(cfg, day):
 def write_report(cfg, day):
     text = build_report(cfg, day)
     path = os.path.join(cfg["state_dir"], f"relatorio_{day}.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+    atomic_write_text(path, text)
     return path
 
 
@@ -556,6 +680,16 @@ def alert_registry_path(cfg):
     return os.path.join(cfg["state_dir"], "alertas_emitidos.json")
 
 
+def load_alert_registry(cfg):
+    path = alert_registry_path(cfg)
+    if not os.path.exists(path):
+        return set()
+    values = read_persistent_json(path)
+    if not isinstance(values, list) or any(not isinstance(item, str) or not item for item in values):
+        raise PersistenceError("Registro de alertas inválido; esperado lista de identificadores textuais.")
+    return set(values)
+
+
 @locked_data_operation
 def pending_alerts(cfg, alertas, day):
     """Devolve só os alertas (MAC, hora) ainda não emitidos no dia.
@@ -563,19 +697,18 @@ def pending_alerts(cfg, alertas, day):
     Sem isso, no modo loop o mesmo alerta seria impresso a cada ciclo.
     """
     path = alert_registry_path(cfg)
-    emitidos = set()
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            emitidos = set(json.load(f))
+    emitidos = load_alert_registry(cfg)
     novos = [(mac, hora, n) for mac, hora, n in alertas if f"{day}|{mac}|{hora}" not in emitidos]
     emitidos.update(f"{day}|{mac}|{hora}" for mac, hora, _ in novos)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(sorted(emitidos), f, indent=1)
+    atomic_write_text(path, json_text(sorted(emitidos)))
     return novos
 
 
 @locked_data_operation
 def run_poll(cfg):
+    state_file, _ = state_paths(cfg)
+    load_state(state_file)
+    load_alert_registry(cfg)
     raw = unifi_get_clients(cfg)
     # Só uma amostra validada pode chegar à gravação de estado e eventos.
     clients = [normalize(r, cfg.get("ap_names")) for r in raw]
@@ -590,7 +723,7 @@ def main(argv):
     cfg = load_config(os.environ.get("COLETORES_CONFIG", DEFAULT_CONFIG))
     CONFIG_COLLECTORS = cfg["collector_macs"]
     cmd = argv[1] if len(argv) > 1 else "poll"
-    if cmd not in ("poll", "loop", "report"):
+    if cmd not in ("poll", "loop", "report", "recover-state"):
         print(__doc__)
         return 2
     try:
@@ -599,6 +732,9 @@ def main(argv):
     except DataDirectoryBusy as exc:
         print(str(exc), file=sys.stderr)
         return 3
+    except PersistenceError as exc:
+        print("Falha de persistência:", str(exc), file=sys.stderr)
+        return 4
 
 
 def _execute_command(cfg, cmd, argv):
@@ -614,12 +750,20 @@ def _execute_command(cfg, cmd, argv):
                 print(dt.datetime.now().isoformat(), f"{len(events)} evento(s)", flush=True)
                 for mac, hora, n in alertas:
                     print(f"ALERTA: {mac} com {n} quedas na hora {hora}h", flush=True)
+            except PersistenceError as exc:
+                print("Falha de persistência:", str(exc), file=sys.stderr)
+                return 4
             except Exception as exc:  # qualquer falha de coleta nao derruba o loop
                 print("Falha na coleta:", exc, flush=True)
             time.sleep(cfg["poll_seconds"])
     elif cmd == "report":
         day = argv[2] if len(argv) > 2 else dt.date.today().isoformat()
         print(write_report(cfg, day))
+    elif cmd == "recover-state":
+        preserved = recover_state(cfg)
+        print("Estado restaurado de estado.json.bak. Reconcilie CSV e lacunas antes de retomar a coleta.")
+        if preserved:
+            print("Estado anterior preservado em", os.path.basename(preserved))
     else:
         print(__doc__)
         return 2
