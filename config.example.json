@@ -3,7 +3,8 @@
   "controller_host": "192.168.1.1",
   "clients_path": "/proxy/network/api/s/SEU_SITE_ID/stat/sta",
   "ssid": "wms",
-  "verify_tls": false,
+  "verify_tls": true,
+  "ca_file": null,
   "poll_seconds": 60,
   "alert_drops_per_hour": 3,
   "collector_macs": {

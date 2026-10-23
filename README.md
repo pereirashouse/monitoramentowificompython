@@ -29,7 +29,8 @@ As reclamações chegavam como "o coletor caiu de novo", sem horário, sem ident
 - **Log em CSV** (`eventos.csv`) com uma linha por evento, fácil de abrir no Excel ou cruzar com os logs da controladora.
 - **Relatório diário em Markdown** com quedas por tipo, coletores mais afetados e alertas.
 - **Alertas sem repetição** no modo contínuo: o mesmo alerta (MAC + hora) aparece uma vez só por dia.
-- **Demonstração sem controladora** (`exemplos/demonstracao.py`) e **21 testes automatizados** rodando no GitHub Actions em Python 3.10 a 3.13.
+- **TLS seguro por padrão**, com validação de certificado e hostname, suporte a CA interna e sem fallback automático para conexão insegura.
+- **Demonstração sem controladora** (`exemplos/demonstracao.py`) e **testes automatizados** de coleta, eventos, relatórios e TLS, executados pelo GitHub Actions em Python 3.10 a 3.13.
 
 ```mermaid
 flowchart LR
@@ -94,8 +95,8 @@ setx UNIFI_API_KEY "sua-chave"
 | `controller_host` | Endereço da controladora, sem `https://`, ex.: `192.168.1.1` |
 | `clients_path` | Caminho da API legada. Veja **Descobrindo o site_id** abaixo. |
 | `ssid` | SSID dos coletores (espaços nas pontas são ignorados) |
-| `verify_tls` | `true` valida o certificado da controladora; `false` aceita certificado autoassinado |
-| `ca_file` | Opcional: caminho de um certificado de CA para validar a controladora |
+| `verify_tls` | Booleano JSON; padrão `true`. Valida certificado e hostname. `false` desativa ambas as verificações e emite aviso de risco; somente para diagnóstico temporário em laboratório isolado. |
+| `ca_file` | Opcional: caminho de um arquivo PEM com a CA confiável. `null`, vazio ou omitido usa as CAs padrão carregadas pelo Python. Caminho relativo é resolvido a partir do diretório de execução; prefira caminho absoluto. |
 | `poll_seconds` | Intervalo do modo `loop`, em segundos (padrão: 60) |
 | `alert_drops_per_hour` | Alerta quando o mesmo MAC passa desse número de quedas na hora (padrão: 3) |
 | `collector_macs` | Inventário opcional: `"mac": "Modelo"` |
@@ -104,12 +105,36 @@ setx UNIFI_API_KEY "sua-chave"
 
 Para usar outro arquivo de configuração, defina a variável `COLETORES_CONFIG` com o caminho dele.
 
+**Certificados e CA interna**
+
+O exemplo agora usa `verify_tls: true`. Isso também é o padrão quando o campo é omitido. Use `true` e `false` sem aspas: valores como `"false"`, `0` ou `null` são rejeitados para evitar configuração ambígua. `ca_file` deve ser `null` ou uma string; booleanos, números, listas e objetos são rejeitados, mesmo no modo de laboratório.
+
+Se a controladora tiver certificado assinado por uma CA já confiável para o Python, mantenha `ca_file: null`. Para uma CA interna, obtenha o certificado público da CA com o administrador por um canal confiável e confira sua impressão digital por um canal independente antes de utilizá-lo. Não publique chaves privadas nem copie como confiável um certificado obtido de uma conexão não autenticada.
+
+Edite os campos abaixo em `config.json`, preservando os demais:
+
+```json
+{
+  "controller_host": "unifi.exemplo.interno",
+  "verify_tls": true,
+  "ca_file": "/caminho/absoluto/ca-interna.pem"
+}
+```
+
+No Windows, um caminho JSON pode usar barras normais, por exemplo `"C:/certificados/ca-interna.pem"`. O arquivo deve conter certificado(s) PEM, sem chave privada. Se o servidor usar certificado autoassinado, prefira substituí-lo por um certificado emitido por uma CA confiável. Caso seja necessário confiar explicitamente naquele certificado, confirme sua autenticidade e forneça seu PEM em `ca_file`, desde que seja compatível com a validação do Python/OpenSSL. Confiar no emissor não dispensa a correspondência do hostname ou IP em `controller_host` com o SAN do certificado.
+
+Um erro `CERTIFICATE_VERIFY_FAILED` deve ser investigado: confira CA/cadeia, validade, relógio e hostname. Se `ca_file` apontar para um arquivo inexistente ou um PEM inválido, a coleta falha sem recorrer às CAs padrão. Omitir o campo ou usar `null`/string vazia é permitido e usa as CAs padrão; nesse caso, o certificado do servidor precisa ser confiável por elas. O monitor **não** tenta novamente com a verificação desligada e **não** registra uma falha TLS como queda de todos os coletores. No modo `loop`, informa a falha e aguarda o próximo ciclo com a mesma política TLS.
+
+`verify_tls: false` permanece apenas para compatibilidade e diagnóstico temporário em laboratório isolado. Essa opção desativa a autenticação do servidor, não apenas a rejeição de certificados autoassinados, pode expor a chave de API a interceptação e ignora `ca_file`. O monitor emite um `RuntimeWarning` explícito. Não use essa opção em produção nem suprima o aviso para contornar um erro de certificado. Configurações antigas não são reescritas automaticamente: se seu `config.json` já contém `false`, ajuste-o manualmente e configure a CA antes de coletar.
+
 **Descobrindo o site_id**
 
 ```bash
-curl -sk -H "X-API-KEY: $UNIFI_API_KEY" \
+curl --fail --silent --show-error -H "X-API-KEY: $UNIFI_API_KEY" \
   https://SEU_CONTROLLER/proxy/network/integration/v1/sites | python3 -m json.tool
 ```
+
+Para CA interna, acrescente `--cacert /caminho/absoluto/ca-interna.pem` ao comando `curl`. Use um hostname ou IP presente no certificado; não acrescente `-k` ou `--insecure` para contornar uma falha.
 
 Procure o campo `internalReference` do seu site e substitua em `clients_path`:
 `/proxy/network/api/s/SEU_SITE_ID/stat/sta`
@@ -136,7 +161,7 @@ python coletores_wifi_monitor.py report 2026-10-15
 python -m unittest discover -v
 ```
 
-Os testes não acessam a controladora: a API é simulada.
+Os testes não acessam a controladora: a API é simulada. A suíte TLS verifica o padrão seguro, o uso de CA, a rejeição de opções ambíguas, o aviso no modo inseguro e a propagação de erros sem fallback. Os contextos SSL são inspecionados, mas a suíte não substitui uma validação ponta a ponta contra o certificado da sua controladora.
 
 ## Exemplo de uso
 
@@ -240,7 +265,7 @@ Dispositivos com MAC aleatório (bit "localmente administrado" ligado) e nome co
 - **API não documentada.** A API legada (`/stat/sta`) não é documentada oficialmente pela Ubiquiti e pode mudar em versões futuras.
 - **Só UniFi.** Outras controladoras (Aruba, Omada, Cisco) precisariam de um novo `unifi_get_clients`.
 - **Queda não é causa.** O monitor mostra quando, onde e com que sinal o coletor caiu. A causa (roaming, interferência, economia de energia do Android, sessão do WMS) ainda precisa ser confirmada com outras fontes.
-- **TLS.** A controladora usa certificado autoassinado por padrão. Prefira `verify_tls: true` com `ca_file`; use `verify_tls: false` só em rede de gerência isolada.
+- **TLS.** Certificados autoassinados ou de CA interna exigem configuração de confiança explícita e hostname/IP compatível. O monitor falha sem reduzir a segurança; um laboratório validado não comprova funcionamento em outras controladoras.
 
 ## Próximos passos
 
@@ -257,6 +282,7 @@ Dispositivos com MAC aleatório (bit "localmente administrado" ligado) e nome co
 - Chave exposta: revogue imediatamente na aplicação Network e gere outra.
 - O agente faz apenas leituras; não altera configuração da controladora.
 - Não execute como root ou administrador.
+- Mantenha `verify_tls: true`; proteja a integridade do arquivo de CA e renove certificados antes de expirarem.
 
 ## Licença
 
